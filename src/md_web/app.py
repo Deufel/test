@@ -414,12 +414,17 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
 
     # ── SSE keepalive ─────────────────────────────────────────────────────────
 
-    async def _keepalive(transport, closed: asyncio.Event, interval: int = 15):
+    async def _keepalive(transport, closed: asyncio.Event,
+                         interval: int = 15, compressor=None):
         try:
             while not closed.is_set():
                 await asyncio.sleep(interval)
                 if not closed.is_set():
-                    await transport.send_str(":\n\n")
+                    if compressor is not None:
+                        chunk = compressor.process(b":\n\n") + compressor.flush()
+                        await transport.send_bytes(chunk)
+                    else:
+                        await transport.send_str(":\n\n")
         except (asyncio.CancelledError, Exception):
             pass
 
@@ -467,17 +472,45 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
 
             result = handler(req)
 
+            # Await coroutines first — the handler may be async def that
+            # returns an async generator, rather than being one itself.
+            if inspect.isawaitable(result) and not inspect.isasyncgen(result):
+                result = await result
+
             if inspect.isasyncgen(result):
                 closed = asyncio.Event()
+
+                # ── Brotli negotiation ────────────────────────────────────
+                # Each SSE connection gets its own compressor instance so
+                # the shared context window is per-client. The growing
+                # context is what gives 100-200:1 ratios on repetitive HTML.
+                compressor = None
+                accept_enc = req["headers"].get("accept-encoding", "")
+                if "br" in accept_enc:
+                    try:
+                        import brotli
+                        compressor = brotli.Compressor(
+                            quality=5,            # good ratio, low CPU
+                            lgwin=22,             # 4MB context window
+                            mode=brotli.MODE_TEXT,
+                        )
+                    except ImportError:
+                        pass  # brotli not installed, fall back to plain text
+
                 headers = [
                     ("content-type",      "text/event-stream"),
                     ("cache-control",     "no-cache"),
                     ("x-accel-buffering", "no"),
-                ] + _cookie_headers(req)
+                ]
+                if compressor is not None:
+                    headers.append(("content-encoding", "br"))
+                headers += _cookie_headers(req)
 
-                transport   = proto.response_stream(200, headers)
-                disconnect  = asyncio.ensure_future(proto.client_disconnect())
-                keepalive   = asyncio.create_task(_keepalive(transport, closed))
+                transport  = proto.response_stream(200, headers)
+                disconnect = asyncio.ensure_future(proto.client_disconnect())
+                keepalive  = asyncio.create_task(
+                    _keepalive(transport, closed, compressor=compressor)
+                )
 
                 def _on_disconnect(fut):
                     closed.set()
@@ -487,12 +520,16 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                     async for event in result:
                         if closed.is_set():
                             break
-                        await transport.send_str(event)
+                        if compressor is not None:
+                            chunk = (compressor.process(event.encode())
+                                     + compressor.flush())
+                            await transport.send_bytes(chunk)
+                        else:
+                            await transport.send_str(event)
                 finally:
                     keepalive.cancel()
                     disconnect.cancel()
             else:
-                result = await result
                 if req.get("_sent"):
                     return
                 _respond(proto, req, result)
