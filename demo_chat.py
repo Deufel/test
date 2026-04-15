@@ -1,10 +1,16 @@
 """
-md-web chat demo — the Tao, taken seriously
-============================================
-Simplification: the server renders ONE thing — the full <body>.
-Every SSE event is a fat morph of the entire body.
-No surgical targeting, no per-component IDs to manage.
-Both /events (read) and /send (write) are SSE streams.
+md-web chat demo
+================
+Two distinct response types — this is the core pattern:
+
+  GET /        → text/html       — full page, served once
+                                   contains data-init="@get('/stream')"
+                                   which Datastar uses to open the SSE connection
+
+  GET /stream  → text/event-stream — long-lived SSE, yields patch_elements forever
+                                     fat-morphs #app on every message
+
+  POST /send   → text/event-stream — short-lived SSE write, clears input signal
 """
 
 import random
@@ -20,7 +26,7 @@ from md_web import (
 head   = mk_tag('head')
 body   = mk_tag('body')
 meta   = mk_tag('meta')
-title  = mk_tag('title')
+title_ = mk_tag('title')
 style  = mk_tag('style')
 div    = mk_tag('div')
 header = mk_tag('header')
@@ -40,6 +46,7 @@ label  = mk_tag('label')
 messages: list[dict] = []
 relay = create_relay()
 
+MAX_MESSAGES = 200
 COLORS = ['#e06c75','#61afef','#98c379','#e5c07b','#c678dd','#56b6c2','#d19a66']
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -64,10 +71,12 @@ header small { color: #6c7086; font-size: .8rem; }
     border-bottom: 1px solid #313244;
 }
 .name-row label { font-size: .85rem; color: #6c7086; }
-main {
+#app {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+}
+#chat {
     flex: 1; overflow-y: auto; padding: 1rem 1.5rem;
-    display: flex; flex-direction: column; gap: .5rem;
-    scroll-behavior: smooth;
+    display: flex; flex-direction: column;
 }
 #msgs {
     display: flex; flex-direction: column; gap: .5rem;
@@ -99,20 +108,19 @@ button {
 button:hover { opacity: .85; }
 """
 
-# ── Rendering — ONE function draws everything ─────────────────────────────────
+# ── Components ────────────────────────────────────────────────────────────────
 
-def page_body():
-    """The entire <body>. This is the only render function."""
-    return body(id='body')(                                      # fat morph target
-        {"data-signals": '{"msg":"","user":"anon"}'},
-        {"data-on:load": "@get('/events')"},            # open SSE read stream
-
+def app_content():
+    """The morphed region. Sent on every SSE update via patch_elements."""
+    return div(
+        id='app',
+        **{"data-signals": '{"msg":"","user":"anon"}'},
+    )(
         header(
             span('💬'),
             h1('md-web chat'),
             small('powered by Datastar + md-web'),
         ),
-
         div(cls='name-row')(
             label(_for='name-input')('your name:'),
             input_(
@@ -121,8 +129,7 @@ def page_body():
                 autocomplete='off', spellcheck='false',
             ),
         ),
-
-        main_(
+        div(id='chat')(
             ul(id='msgs')(
                 *[
                     li(cls='msg')(
@@ -133,7 +140,6 @@ def page_body():
                 ],
             ),
         ),
-
         footer(
             input_(
                 type='text', placeholder='type a message…',
@@ -144,17 +150,31 @@ def page_body():
         ),
     )
 
-def shell():
-    """Static shell — served once. Body is immediately replaced by the SSE stream."""
+def landing():
+    """
+    Full HTML page — returned once as text/html.
+
+    The data-init on #app is what Datastar uses to open the SSE stream.
+    It fires when Datastar initialises the element, before any morphing
+    has happened, so the connection is always established.
+    """
     h = head(
         meta(charset='utf-8'),
         meta(name='viewport', content='width=device-width, initial-scale=1'),
-        title('md-web chat'),
+        title_('md-web chat'),
         Favicon('💬'),
         style(Safe(CSS)),
         Datastar(),
     )
-    return html_doc(h, page_body())
+    b = body(
+        # data-init opens the SSE stream as soon as Datastar is ready.
+        # This div IS the morph target — but data-init fires before
+        # any patch arrives, so the connection is established first.
+        app_content()(
+            **{"data-init": "@get('/stream')"},
+        ),
+    )
+    return html_doc(h, b)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -162,41 +182,48 @@ app = create_app()
 
 @app.get('/')
 async def index(req):
-    print('[/] serving shell')
-    return shell()
+    """Return the full HTML page — text/html, served once."""
+    print('[/] serving landing page')
+    return landing()
 
-@app.get('/events')
-async def events(req):
-    """Long-lived SSE read stream. Sends full body on connect and on every message."""
-    print('[/events] client connected')
-    async def stream():
-        print('[/events] sending initial body')
-        yield patch_elements(page_body())
+@app.get('/stream')
+async def stream(req):
+    """
+    Long-lived SSE stream — text/event-stream.
+    Sends the full #app on connect, then on every message.
+    """
+    print('[/stream] client connected')
+    async def _stream():
+        print('[/stream] sending initial state')
+        event = patch_elements(app_content())
+        print(f'[/stream] event repr:\n{event!r}')
+        yield event
         async for _topic, _data in relay.subscribe('chat.message'):
-            print(f'[/events] broadcasting, {len(messages)} messages')
-            yield patch_elements(page_body())
-    return stream()
+            print(f'[/stream] push → {len(messages)} messages')
+            yield patch_elements(app_content())
+    return _stream()
 
 @app.post('/send')
 async def send(req):
-    """Short-lived SSE write. Appends message, broadcasts, clears input signal."""
+    """Short-lived SSE write — appends message, broadcasts, clears input."""
     data = await signals(req)
     text = (data.get('msg') or '').strip()
     name = (data.get('user') or 'anon').strip() or 'anon'
     print(f'[/send] {name!r}: {text!r}')
 
-    async def stream():
+    async def _stream():
         if text:
             messages.append({
                 'name': name,
                 'text': text,
                 'color': random.choice(COLORS),
             })
+            if len(messages) > MAX_MESSAGES:
+                del messages[0]
             relay.publish('chat.message', None)
-        # Clear the input signal on the sending client
         yield patch_signals({'msg': ''})
 
-    return stream()
+    return _stream()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

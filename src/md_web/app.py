@@ -130,6 +130,9 @@ def create_relay():
 
         async for topic, data in relay.subscribe("chat.*"):
             yield patch_elements(render(data))    # async generator
+
+        # High-performance broadcast: pre-render once, fan out bytes to N clients
+        relay.broadcast("chat.*", b"event: datastar-patch-elements\ndata: ...")
     """
     subs: list[tuple[str, asyncio.Queue]] = []
     lock = threading.Lock()
@@ -139,6 +142,20 @@ def create_relay():
             targets = [(p, q) for p, q in subs if fnmatch(topic, p)]
         for _, queue in targets:
             try:    queue.put_nowait((topic, data))
+            except: pass  # noqa: E722
+
+    def broadcast(topic: str, payload: bytes):
+        """Fan out pre-encoded bytes to all matching subscribers.
+
+        Unlike publish(), broadcast() puts the same bytes object into every
+        matching queue — O(1) encode, O(N) queue puts (the queue put is a
+        pointer copy, not a data copy). Each SSE handler calls send_bytes
+        directly without any further encoding work.
+        """
+        with lock:
+            targets = [(p, q) for p, q in subs if fnmatch(topic, p)]
+        for _, queue in targets:
+            try:    queue.put_nowait(("__broadcast__", payload))
             except: pass  # noqa: E722
 
     async def subscribe(pattern: str):
@@ -154,10 +171,72 @@ def create_relay():
                 except: pass  # noqa: E722
 
     class _Relay:
-        __slots__ = ("publish", "subscribe")
+        __slots__ = ("publish", "subscribe", "broadcast", "subscriber_count")
+
+    def subscriber_count(pattern: str = "*") -> int:
+        with lock:
+            return sum(1 for p, _ in subs if fnmatch(pattern, p))
+
     r = _Relay()
     r.publish, r.subscribe = publish, subscribe
+    r.broadcast = broadcast
+    r.subscriber_count = subscriber_count
     return r
+
+
+# ── O(1) broadcaster ─────────────────────────────────────────────────────────
+
+def create_broadcaster(relay, render_fn, *, topic: str = "broadcast"):
+    """Wrap a relay with a pre-render-and-fan-out broadcaster.
+
+    Instead of each of N SSE handlers independently calling render_fn() and
+    compressing the result, the broadcaster:
+
+      1. Calls render_fn() ONCE → SSE event string
+      2. Compresses it ONCE with gzip (shared across all clients)
+      3. Fans out the same bytes to all N transport queues via relay.broadcast()
+
+    This reduces the per-broadcast work from O(N) renders + O(N) compressions
+    to O(1) render + O(1) compression + O(N) queue puts (pointer copies).
+
+    SSE handlers must subscribe to topic and use send_bytes directly.
+
+    Usage::
+
+        broadcaster = create_broadcaster(relay, lambda: patch_elements(view()))
+
+        # In your stream handler:
+        async def stream():
+            yield patch_elements(view())           # initial state
+            async for _topic, payload in relay.subscribe(topic):
+                if _topic == "__broadcast__":
+                    # payload is already compressed bytes — send directly
+                    yield payload   # framework detects bytes and uses send_bytes
+            return stream()
+
+        # To trigger a broadcast:
+        broadcaster.push()
+    """
+    import zlib
+
+    def push():
+        event_str  = render_fn()                        # render once
+        compressed = _gzip_compress(event_str.encode()) # compress once
+        relay.broadcast(topic, compressed)              # fan out bytes
+
+    class _Broadcaster:
+        __slots__ = ("push", "topic")
+    b = _Broadcaster()
+    b.push  = push
+    b.topic = topic
+    return b
+
+
+def _gzip_compress(data: bytes, level: int = 6) -> bytes:
+    """Compress bytes with gzip at the given level."""
+    import zlib
+    compress = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    return compress.compress(data) + compress.flush()
 
 
 # ── Cookie signer ────────────────────────────────────────────────────────────
@@ -415,7 +494,8 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
     # ── SSE keepalive ─────────────────────────────────────────────────────────
 
     async def _keepalive(transport, closed: asyncio.Event,
-                         interval: int = 15, compressor=None):
+                         interval: int = 15, compressor=None,
+                         use_gzip: bool = False):
         try:
             while not closed.is_set():
                 await asyncio.sleep(interval)
@@ -423,10 +503,15 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                     if compressor is not None:
                         chunk = compressor.process(b":\n\n") + compressor.flush()
                         await transport.send_bytes(chunk)
+                    elif use_gzip:
+                        await transport.send_bytes(_gzip_compress(b":\n\n"))
                     else:
                         await transport.send_str(":\n\n")
         except (asyncio.CancelledError, Exception):
             pass
+
+    # ── Active SSE connection counter ────────────────────────────────────────
+    _sse_connections = [0]   # mutable int in a list so closures can write it
 
     # ── RSGI entrypoint ───────────────────────────────────────────────────────
 
@@ -480,36 +565,68 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
             if inspect.isasyncgen(result):
                 closed = asyncio.Event()
 
-                # ── Brotli negotiation ────────────────────────────────────
-                # Each SSE connection gets its own compressor instance so
-                # the shared context window is per-client. The growing
-                # context is what gives 100-200:1 ratios on repetitive HTML.
+                # ── Compression negotiation ───────────────────────────────
+                # Two modes:
+                #
+                # 1. Per-client brotli (default for long-lived streams):
+                #    Each connection gets its own brotli.Compressor. The
+                #    shared context window grows over time giving 100-200:1
+                #    ratios on repetitive HTML. Cost: O(N) compressions per
+                #    broadcast.
+                #
+                # 2. Pre-compressed bytes (broadcaster pattern):
+                #    When the async generator yields raw bytes instead of a
+                #    str, those bytes are sent directly via send_bytes with
+                #    content-encoding: gzip. The broadcaster pre-compresses
+                #    once and fans out the same bytes to all N clients —
+                #    O(1) compression regardless of N.
+                #    Use create_broadcaster() to produce these payloads.
+                #
+                # The framework detects which mode to use per-event based on
+                # whether the yielded value is bytes or str.
+
                 compressor = None
                 accept_enc = req["headers"].get("accept-encoding", "")
-                if "br" in accept_enc:
+                use_brotli = "br" in accept_enc
+                use_gzip   = "gzip" in accept_enc
+
+                if use_brotli:
                     try:
                         import brotli
                         compressor = brotli.Compressor(
-                            quality=5,            # good ratio, low CPU
-                            lgwin=22,             # 4MB context window
+                            quality=5,
+                            lgwin=22,
                             mode=brotli.MODE_TEXT,
                         )
                     except ImportError:
-                        pass  # brotli not installed, fall back to plain text
+                        use_brotli = False
+
+                # content-encoding is declared once at stream open.
+                # For the broadcaster pattern we use gzip (pre-compressed).
+                # For per-client brotli we use br.
+                # If neither is available we send plain text.
+                if use_brotli and compressor:
+                    enc_header = ("content-encoding", "br")
+                elif use_gzip:
+                    enc_header = ("content-encoding", "gzip")
+                else:
+                    enc_header = None
 
                 headers = [
                     ("content-type",      "text/event-stream"),
                     ("cache-control",     "no-cache"),
                     ("x-accel-buffering", "no"),
                 ]
-                if compressor is not None:
-                    headers.append(("content-encoding", "br"))
+                if enc_header:
+                    headers.append(enc_header)
                 headers += _cookie_headers(req)
 
+                _sse_connections[0] += 1
                 transport  = proto.response_stream(200, headers)
                 disconnect = asyncio.ensure_future(proto.client_disconnect())
                 keepalive  = asyncio.create_task(
-                    _keepalive(transport, closed, compressor=compressor)
+                    _keepalive(transport, closed, compressor=compressor,
+                               use_gzip=use_gzip and not compressor)
                 )
 
                 def _on_disconnect(fut):
@@ -520,13 +637,25 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                     async for event in result:
                         if closed.is_set():
                             break
-                        if compressor is not None:
+                        if isinstance(event, bytes):
+                            # Pre-compressed payload from broadcaster.
+                            # Already gzip-encoded — send directly.
+                            await transport.send_bytes(event)
+                        elif compressor is not None:
+                            # Per-client brotli path
                             chunk = (compressor.process(event.encode())
                                      + compressor.flush())
                             await transport.send_bytes(chunk)
+                        elif use_gzip:
+                            # gzip mode (no brotli) — must compress str events
+                            # too so the stream encoding stays consistent.
+                            await transport.send_bytes(
+                                _gzip_compress(event.encode())
+                            )
                         else:
                             await transport.send_str(event)
                 finally:
+                    _sse_connections[0] -= 1
                     keepalive.cancel()
                     disconnect.cancel()
             else:

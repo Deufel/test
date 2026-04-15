@@ -18,7 +18,7 @@ from md_web import (
     Safe, html_doc, mk_tag,
     Datastar, Favicon,
     patch_elements, patch_signals,
-    create_app, create_relay, signals, serve,
+    create_app, create_relay, create_broadcaster, signals, serve,
 )
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
@@ -45,7 +45,9 @@ label  = mk_tag('label')
 
 messages: list[dict] = []
 relay = create_relay()
+broadcaster = create_broadcaster(relay, lambda: patch_elements(app_content()))
 
+MAX_MESSAGES = 200
 COLORS = ['#e06c75','#61afef','#98c379','#e5c07b','#c678dd','#56b6c2','#d19a66']
 
 # ── CSS ───────────────────────────────────────────────────────────────────────
@@ -189,15 +191,16 @@ async def index(req):
 async def stream(req):
     """
     Long-lived SSE stream — text/event-stream.
-    Sends the full #app on connect, then on every message.
+    Initial state rendered per-client (personalised if needed).
+    Subsequent updates use pre-compressed broadcaster bytes — O(1) work.
     """
     print('[/stream] client connected')
     async def _stream():
-        print('[/stream] sending initial state')
+        # Initial state: render once for this client
         yield patch_elements(app_content())
-        async for _topic, _data in relay.subscribe('chat.message'):
-            print(f'[/stream] push → {len(messages)} messages')
-            yield patch_elements(app_content())
+        # Subsequent updates: receive pre-compressed bytes from broadcaster
+        async for _topic, payload in relay.subscribe(broadcaster.topic):
+            yield payload   # bytes — framework calls send_bytes directly
     return _stream()
 
 @app.post('/send')
@@ -215,7 +218,9 @@ async def send(req):
                 'text': text,
                 'color': random.choice(COLORS),
             })
-            relay.publish('chat.message', None)
+            if len(messages) > MAX_MESSAGES:
+                del messages[0]
+            broadcaster.push()
         yield patch_signals({'msg': ''})
 
     return _stream()
