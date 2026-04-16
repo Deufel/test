@@ -237,10 +237,128 @@ def create_broadcaster(relay, render_fn, *, topic: str = "broadcast"):
 
 
 def _gzip_compress(data: bytes, level: int = 6) -> bytes:
-    """Compress bytes with gzip at the given level."""
+    """Compress bytes as a complete self-contained gzip file."""
     import zlib
     compress = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS | 16)
     return compress.compress(data) + compress.flush()
+
+
+def _gzip_sse_chunk(data: bytes, level: int = 6) -> bytes:
+    """Compress one SSE event chunk for a streaming gzip response.
+
+    Uses Z_SYNC_FLUSH instead of Z_FINISH so the gzip stream stays open
+    for subsequent chunks. The browser can decompress this chunk immediately
+    without waiting for the stream to end.
+    """
+    import zlib
+    compress = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    return compress.compress(data) + compress.flush(zlib.Z_SYNC_FLUSH)
+
+
+# ── Shared-stream channel ─────────────────────────────────────────────────────
+
+def create_channel(*, gzip_level: int = 6):
+    """A broadcast channel that compresses ONCE and fans out to N clients.
+
+    Unlike the relay+broadcaster pattern (O(1) render, O(N) compressions),
+    create_channel achieves O(1) render AND O(1) compression by maintaining
+    one persistent gzip compressor shared across all clients.
+
+    Every connected client receives the exact same compressed bytes —
+    no per-client encoding work at all.
+
+    How it works
+    ------------
+    The channel holds a persistent ``zlib.compressobj`` in streaming mode.
+    When ``push(event_str)`` is called:
+
+      1. Feed the SSE event string through the shared compressor → flush
+      2. Iterate over all connected transports → send_bytes (same bytes)
+
+    Clients joining mid-stream receive the gzip stream from the current
+    compressor state forward. The browser's gzip decoder handles this
+    correctly because gzip is a continuous stream — a new decoder simply
+    starts decompressing from whatever bytes it first receives.
+
+    Trade-offs vs per-client brotli
+    --------------------------------
+    - Compression ratio  : lower (no context window accumulation per client)
+    - Compression cost   : O(1) instead of O(N) — massive win at scale
+    - Send cost          : O(N) — unavoidable, one socket per client
+    - Encoding           : gzip (universal, all browsers, all clients)
+    - Late-join clients  : get valid gzip stream from join point forward
+                           (no backfill — send initial state separately)
+
+    Usage::
+
+        channel = create_channel()
+
+        @app.get("/stream")
+        async def stream(req):
+            # Send initial state per-client (plain text, before joining)
+            yield patch_elements(view())
+            # Then join the shared channel — receives compressed bytes directly
+            async for chunk in channel.subscribe():
+                yield chunk   # bytes — framework calls send_bytes
+
+        # To broadcast (call from any route handler):
+        channel.push(patch_elements(view()))
+    """
+    import zlib
+
+    _compressor = zlib.compressobj(gzip_level, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    _lock       = threading.Lock()
+    _queues: list[asyncio.Queue] = []
+
+    def push(event_str: str) -> int:
+        """Compress event_str ONCE and enqueue the same bytes to all clients.
+
+        Returns the number of clients reached.
+        """
+        data  = event_str.encode()
+        # compress + Z_SYNC_FLUSH ensures the decoder can decompress
+        # this chunk immediately without waiting for more data
+        with _lock:
+            chunk   = (_compressor.compress(data)
+                       + _compressor.flush(zlib.Z_SYNC_FLUSH))
+            targets = list(_queues)
+
+        for q in targets:
+            try:    q.put_nowait(chunk)
+            except: pass  # noqa: E722 — never block the caller
+        return len(targets)
+
+    async def subscribe():
+        """Async generator that yields compressed byte chunks.
+
+        Yields bytes — the framework's SSE handler sees bytes and calls
+        send_bytes directly, bypassing any per-client compression.
+        Leaves the gzip stream open for the next push().
+        """
+        queue = asyncio.Queue()
+        with _lock:
+            _queues.append(queue)
+        try:
+            while True:
+                chunk = await queue.get()
+                yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        finally:
+            with _lock:
+                try:    _queues.remove(queue)
+                except: pass
+
+    def client_count() -> int:
+        with _lock: return len(_queues)
+
+    class _Channel:
+        __slots__ = ("push", "subscribe", "client_count")
+    c = _Channel()
+    c.push         = push
+    c.subscribe    = subscribe
+    c.client_count = client_count
+    return c
 
 
 # ── Cookie signer ────────────────────────────────────────────────────────────
@@ -498,8 +616,7 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
     # ── SSE keepalive ─────────────────────────────────────────────────────────
 
     async def _keepalive(transport, closed: asyncio.Event,
-                         interval: int = 15, compressor=None,
-                         use_gzip: bool = False):
+                         interval: int = 15, compressor=None):
         try:
             while not closed.is_set():
                 await asyncio.sleep(interval)
@@ -507,8 +624,6 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                     if compressor is not None:
                         chunk = compressor.process(b":\n\n") + compressor.flush()
                         await transport.send_bytes(chunk)
-                    elif use_gzip:
-                        await transport.send_bytes(_gzip_compress(b":\n\n"))
                     else:
                         await transport.send_str(":\n\n")
         except (asyncio.CancelledError, Exception):
@@ -589,32 +704,41 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                 # The framework detects which mode to use per-event based on
                 # whether the yielded value is bytes or str.
 
-                compressor = None
-                accept_enc = req["headers"].get("accept-encoding", "")
-                use_brotli = "br" in accept_enc
-                use_gzip   = "gzip" in accept_enc
+                # ── Encoding mode ────────────────────────────────────
+                # Two paths:
+                #
+                # A) channel mode  (req["_sse_encoding"] == "gzip"):
+                #    Handler yields pre-compressed gzip bytes from
+                #    create_channel(). One compressor shared by all clients.
+                #    Declare content-encoding: gzip, skip per-client brotli.
+                #    Initial plain-text event is gzip-compressed inline.
+                #
+                # B) per-client brotli (default):
+                #    Each client gets its own brotli.Compressor with a
+                #    growing context window. Best compression ratio.
+                #    Falls back to plain text if brotli not installed.
 
-                if use_brotli:
-                    try:
-                        import brotli
-                        compressor = brotli.Compressor(
-                            quality=5,
-                            lgwin=22,
-                            mode=brotli.MODE_TEXT,
-                        )
-                    except ImportError:
-                        use_brotli = False
+                sse_encoding = req.get("_sse_encoding")
+                compressor   = None
 
-                # content-encoding is declared once at stream open.
-                # For the broadcaster pattern we use gzip (pre-compressed).
-                # For per-client brotli we use br.
-                # If neither is available we send plain text.
-                if use_brotli and compressor:
-                    enc_header = ("content-encoding", "br")
-                elif use_gzip:
+                if sse_encoding == "gzip":
+                    # Channel mode — pre-compressed bytes from create_channel.
+                    # Don't create a per-client compressor.
                     enc_header = ("content-encoding", "gzip")
                 else:
-                    enc_header = None
+                    # Per-client brotli mode
+                    accept_enc = req["headers"].get("accept-encoding", "")
+                    if "br" in accept_enc:
+                        try:
+                            import brotli
+                            compressor = brotli.Compressor(
+                                quality=5,
+                                lgwin=22,
+                                mode=brotli.MODE_TEXT,
+                            )
+                        except ImportError:
+                            pass
+                    enc_header = ("content-encoding", "br") if compressor else None
 
                 headers = [
                     ("content-type",      "text/event-stream"),
@@ -629,8 +753,7 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                 transport  = proto.response_stream(200, headers)
                 disconnect = asyncio.ensure_future(proto.client_disconnect())
                 keepalive  = asyncio.create_task(
-                    _keepalive(transport, closed, compressor=compressor,
-                               use_gzip=use_gzip and not compressor)
+                    _keepalive(transport, closed, compressor=compressor)
                 )
 
                 def _on_disconnect(fut):
@@ -642,19 +765,19 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
                         if closed.is_set():
                             break
                         if isinstance(event, bytes):
-                            # Pre-compressed payload from broadcaster.
-                            # Already gzip-encoded — send directly.
+                            # Pre-compressed bytes from create_channel()
                             await transport.send_bytes(event)
                         elif compressor is not None:
-                            # Per-client brotli path
+                            # Per-client brotli
                             chunk = (compressor.process(event.encode())
                                      + compressor.flush())
                             await transport.send_bytes(chunk)
-                        elif use_gzip:
-                            # gzip mode (no brotli) — must compress str events
-                            # too so the stream encoding stays consistent.
+                        elif sse_encoding == "gzip":
+                            # Channel mode: str event (e.g. initial state)
+                            # must be gzip-compressed inline to stay consistent
+                            # with the declared content-encoding: gzip
                             await transport.send_bytes(
-                                _gzip_compress(event.encode())
+                                _gzip_sse_chunk(event.encode())
                             )
                         else:
                             await transport.send_str(event)
@@ -679,9 +802,21 @@ def create_app(routes: dict | None = None, *, on_init=None, on_del=None):
 
     def _rsgi_init(loop):
         if on_init:
-            result = on_init(loop)
-            if inspect.iscoroutine(result):
-                loop.run_until_complete(result)
+            try:
+                result = on_init(loop)
+                if inspect.iscoroutine(result):
+                    if loop.is_running():
+                        # Embedded server: loop is already running.
+                        # Schedule startup as a task — it will complete
+                        # before any requests are served since the event
+                        # loop processes tasks in order.
+                        loop.create_task(result)
+                    else:
+                        # CLI server: loop not yet running, block until done.
+                        loop.run_until_complete(result)
+            except Exception:
+                traceback.print_exc()
+                raise
 
     def _rsgi_del(loop):
         if on_del:

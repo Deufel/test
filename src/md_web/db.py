@@ -74,24 +74,18 @@ async def create_db(path: str) -> "apsw.Connection":
     Rows are returned as frozen dataclasses so render functions can use
     ``row.name``, ``row.text`` etc. instead of ``row[0]``, ``row[1]``.
 
-    Call from ``on_init`` and attach to your app::
+    Call from ``on_init``::
 
         async def startup(loop):
-            app.db    = await create_db("chat.db")
-            app.relay = await create_db_relay(app.db)
-            await migrate(app.db, SCHEMA)
+            global db, relay
+            db    = await create_db("chat.db")
+            relay = await create_db_relay(db)
+            await migrate(db, SCHEMA)
 
         app = create_app(on_init=startup)
     """
     db = await apsw.Connection.as_async(path)
-
-    # bestpractice sets WAL globally but we confirm it per-connection
     await db.pragma("journal_mode", "wal")
-
-    # Rows come back as frozen dataclasses: row.id, row.name, etc.
-    db.row_trace = apsw.ext.DataClassRowFactory(
-        dataclass_kwargs={"frozen": True}
-    )
 
     log.debug("db opened: %s", path)
     return db
@@ -227,7 +221,7 @@ async def query(
 ) -> list:
     """Execute a SELECT safely, capped at *limit* rows.
 
-    Returns a list of frozen dataclass rows (column names as attributes).
+    Returns a list of plain tuples. Use index access: row[0], row[1].
     Never raises on row-limit breach — returns partial results with a
     debug log. Use for all read queries in SSE handlers::
 
@@ -235,21 +229,17 @@ async def query(
             "SELECT * FROM messages ORDER BY ts DESC LIMIT ?",
             (50,),
         )
-        for m in reversed(messages):
-            # m.name, m.text, m.color, m.ts
+        for row in reversed(messages):
+            # row[0]=id, row[1]=name, row[2]=text ...
             ...
     """
     rows = []
-
-    async def _fetch():
-        cursor = await db.execute(sql, bindings)
-        async for row in cursor:
-            rows.append(row)
-            if len(rows) >= limit:
-                log.debug("query: row limit %d hit, truncating", limit)
-                break
-
-    await db.async_run(_fetch)
+    cursor = await db.execute(sql, bindings)
+    async for row in cursor:
+        rows.append(row)
+        if len(rows) >= limit:
+            log.debug("query: row limit %d hit, truncating", limit)
+            break
     return rows
 
 
