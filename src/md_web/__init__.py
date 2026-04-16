@@ -7,7 +7,7 @@ md_web.sse      Datastar SSE event formatters
 md_web.app      RSGI application factory and request helpers
 md_web.server   Background server utilities
 md_web.tunnel   ngrok tunnel helpers
-md_web.db       Async SQLite via APSW (optional, requires: uv add apsw)
+md_web.db       Async SQLite via APSW (requires: uv add apsw)
 
 Flat imports
 ------------
@@ -60,7 +60,6 @@ from .app import (
     set_cookie,
     create_relay,
     create_broadcaster,
-    create_channel,
     create_signer,
     static,
     create_app,
@@ -84,22 +83,15 @@ from .tunnel import (
     stop_tunnel,
 )
 
-# ── db (optional — requires apsw) ────────────────────────────────────────────
-try:
-    from .db import (
-        create_db,
-        create_db_relay,
-        migrate,
-        query as db_query,
-        write as db_write,
-        DbRelay,
-    )
-    __all__ += [
-        "create_db", "create_db_relay", "migrate",
-        "db_query", "db_write", "DbRelay",
-    ]
-except ImportError:
-    pass  # apsw not installed — db features silently unavailable
+# ── db ───────────────────────────────────────────────────────────────────────
+from .db import (
+    create_db,
+    create_db_relay,
+    migrate,
+    query as db_query,
+    write as db_write,
+    DbRelay,
+)
 
 __all__ = [
     # html
@@ -110,12 +102,14 @@ __all__ = [
     # sse
     "execute_script", "patch_elements", "patch_signals", "remove_signals",
     # app
-    "body", "body_stream", "create_app", "create_broadcaster", "create_channel", "create_relay", "create_signer",
-    "header_values", "serve", "set_cookie", "signals", "static",
+    "body", "body_stream", "create_app", "create_broadcaster", "create_relay",
+    "create_signer", "header_values", "serve", "set_cookie", "signals", "static",
     # server
     "ServerState", "dev_alive", "request_logger", "serve_background", "stop_background",
     # tunnel
     "TunnelState", "load_env", "start_tunnel", "stop_tunnel",
+    # db
+    "create_db", "create_db_relay", "migrate", "db_query", "db_write", "DbRelay",
 ]
 
 

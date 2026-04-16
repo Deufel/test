@@ -53,29 +53,16 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-# ── APSW import guard ─────────────────────────────────────────────────────────
+import apsw
+import apsw.aio
+import apsw.bestpractice
+import apsw.ext
 
-try:
-    import apsw
-    import apsw.aio
-    import apsw.bestpractice
-    import apsw.ext
-    _APSW = True
-except ImportError:
-    _APSW = False
-
-def _require_apsw():
-    if not _APSW:
-        raise RuntimeError(
-            "md_web.db requires apsw — run: uv add apsw"
-        )
-
-# Apply best practices once at import time if apsw is available.
-# This sets WAL, foreign keys, synchronous=NORMAL, recursive triggers,
+# Apply best practices once at import time.
+# Sets WAL, foreign keys, synchronous=NORMAL, recursive triggers,
 # mmap, cache size — the recommended defaults for every app.
-if _APSW:
-    apsw.bestpractice.apply(apsw.bestpractice.recommended)
-    apsw.ext.log_sqlite()  # forward SQLite internal logs to Python logging
+apsw.bestpractice.apply(apsw.bestpractice.recommended)
+apsw.ext.log_sqlite()  # forward SQLite internal logs to Python logging
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -96,7 +83,6 @@ async def create_db(path: str) -> "apsw.Connection":
 
         app = create_app(on_init=startup)
     """
-    _require_apsw()
     db = await apsw.Connection.as_async(path)
 
     # bestpractice sets WAL globally but we confirm it per-connection
@@ -225,7 +211,6 @@ async def create_db_relay(db: "apsw.Connection") -> DbRelay:
 
         app = create_app(on_init=startup)
     """
-    _require_apsw()
     relay = DbRelay(db)
     await relay._install_hook()
     return relay
