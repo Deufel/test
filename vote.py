@@ -1,35 +1,31 @@
 """
 md-web live poll demo
-======================
-A real-time voting app demonstrating the full stack:
+=====================
+Real-time voting with SQLite + SSE. Demonstrates the full stack:
 
-  md_web.db    → SQLite/APSW persistence + update_hook relay
-  md_web.app   → RSGI framework, CQRS routes
-  md_web.html  → Tag-based rendering
-  md_web.sse   → Datastar SSE events
+  md_web.db   → sync APSW, WAL, update_hook → asyncio relay + broadcaster
+  md_web.app  → RSGI framework, CQRS routes
+  md_web.html → tag-based rendering
+  md_web.sse  → Datastar SSE events
 
-CQRS pattern
+Architecture
 ------------
-  GET  /          → full HTML page (once)
-  GET  /stream    → long-lived SSE, fat-morphs #app on every DB change
-  POST /vote      → INSERT vote (write), returns patch_signals to clear UI
-  POST /new-poll  → INSERT poll + options (write)
-
-The update_hook on the SQLite connection fires after every write.
-The DbRelay wakes all /stream subscribers. Each re-reads from DB
-and sends a fresh render. No manual relay.publish() needed.
+  DB writes are plain sync APSW calls — fast, simple.
+  The update_hook fires after every write, renders the app ONCE,
+  caches the SSE string, and wakes all connected SSE streams via
+  an asyncio.Event. Each stream yields the same cached string —
+  O(1) renders per write regardless of how many clients are connected.
 
 Run
 ---
   uv add apsw
   uv run python demo_poll.py
-
-Then open http://localhost:8000
+  open http://localhost:8000
 """
 
 import asyncio
 import time
-import random
+
 from md_web import (
     Safe, html_doc, mk_tag,
     Datastar, Favicon,
@@ -40,25 +36,31 @@ from md_web.db import create_db, create_db_relay, migrate, query, write
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
 
-head   = mk_tag('head')
-body   = mk_tag('body')
-meta   = mk_tag('meta')
-title_ = mk_tag('title')
-style  = mk_tag('style')
-div    = mk_tag('div')
-h1     = mk_tag('h1')
-h2     = mk_tag('h2')
-h3     = mk_tag('h3')
-p      = mk_tag('p')
-span   = mk_tag('span')
-button = mk_tag('button')
-input_ = mk_tag('input')
-label  = mk_tag('label')
-form   = mk_tag('form')
-small  = mk_tag('small')
-footer = mk_tag('footer')
-header = mk_tag('header')
+head    = mk_tag('head')
+body    = mk_tag('body')
+meta    = mk_tag('meta')
+title_  = mk_tag('title')
+style   = mk_tag('style')
+div     = mk_tag('div')
+h1      = mk_tag('h1')
+h2      = mk_tag('h2')
+h3      = mk_tag('h3')
+span    = mk_tag('span')
+button  = mk_tag('button')
+input_  = mk_tag('input')
+label   = mk_tag('label')
+small   = mk_tag('small')
+footer  = mk_tag('footer')
+header  = mk_tag('header')
 section = mk_tag('section')
+
+# ── Tuple column indexes ──────────────────────────────────────────────────────
+
+# polls  (id, question, created_at)
+POLL_ID, POLL_QUESTION = 0, 1
+
+# options (id, poll_id, text, color)
+OPT_ID, OPT_POLL_ID, OPT_TEXT, OPT_COLOR = 0, 1, 2, 3
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -105,17 +107,20 @@ SEED_POLLS = [
     },
 ]
 
-def _seed_sync(db):
-    """Insert seed data if polls table is empty. Runs in worker thread."""
-    count = db.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
+def seed(conn):
+    count = conn.execute("SELECT COUNT(*) FROM polls").fetchone()[0]
     if count > 0:
         return
-    with db:
+    with conn:
         for poll in SEED_POLLS:
-            db.execute("INSERT INTO polls(question) VALUES(?)", (poll["question"],))
-            poll_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO polls(question) VALUES(?)", (poll["question"],)
+            )
+            poll_id = conn.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
             for text, color in poll["options"]:
-                db.execute(
+                conn.execute(
                     "INSERT INTO options(poll_id, text, color) VALUES(?,?,?)",
                     (poll_id, text, color),
                 )
@@ -178,10 +183,7 @@ header small { color: #64748b; font-size: .8rem; margin-left: auto; }
     line-height: 1.4;
     flex: 1;
 }
-.poll .total {
-    font-size: .75rem;
-    color: #64748b;
-}
+.poll .total { font-size: .75rem; color: #64748b; }
 .delete-btn {
     background: none;
     border: 1px solid #334155;
@@ -195,19 +197,13 @@ header small { color: #64748b; font-size: .8rem; margin-left: auto; }
 }
 .delete-btn:hover { border-color: #ef4444; color: #ef4444; }
 
-/* Option row */
-.option {
-    display: flex;
-    flex-direction: column;
-    gap: .3rem;
-}
+/* Option rows */
+.option { display: flex; flex-direction: column; gap: .3rem; }
 .option-row {
     display: flex;
     align-items: center;
     gap: .75rem;
-    cursor: pointer;
 }
-.option-row:hover .opt-btn { opacity: .85; }
 .opt-btn {
     border: none;
     border-radius: .4rem;
@@ -220,19 +216,9 @@ header small { color: #64748b; font-size: .8rem; margin-left: auto; }
     min-width: 90px;
     transition: opacity .15s;
 }
-.opt-label {
-    font-size: .9rem;
-    color: #cbd5e1;
-    flex: 1;
-}
-.opt-count {
-    font-size: .78rem;
-    color: #94a3b8;
-    min-width: 48px;
-    text-align: right;
-}
-
-/* Bar */
+.opt-btn:hover { opacity: .85; }
+.opt-label { font-size: .9rem; color: #cbd5e1; flex: 1; }
+.opt-count { font-size: .78rem; color: #94a3b8; min-width: 48px; text-align: right; }
 .bar-track {
     height: 6px;
     background: #334155;
@@ -310,11 +296,6 @@ def render_bar(count, total, color):
         div(cls='bar-fill', style=f'width:{pct}%; background:{color}'),
     )
 
-# Option tuple: (id, poll_id, text, color)
-OPT_ID, OPT_POLL_ID, OPT_TEXT, OPT_COLOR = 0, 1, 2, 3
-# Poll tuple:   (id, question, created_at)
-POLL_ID, POLL_QUESTION = 0, 1
-
 def render_option(opt, count, total):
     return div(cls='option')(
         div(cls='option-row')(
@@ -329,9 +310,8 @@ def render_option(opt, count, total):
         render_bar(count, total, opt[OPT_COLOR]),
     )
 
-def render_poll(poll, options, vote_counts):
-    # Sum only the votes for options belonging to THIS poll
-    total = sum(vote_counts.get(opt[OPT_ID], 0) for opt in options)
+def render_poll(poll, options, counts):
+    total = sum(counts.get(opt[OPT_ID], 0) for opt in options)
     return div(cls='poll', id=f'poll-{poll[POLL_ID]}')(
         div(cls='poll-header')(
             h3(poll[POLL_QUESTION]),
@@ -341,7 +321,7 @@ def render_poll(poll, options, vote_counts):
             )('✕ delete'),
         ),
         span(f'{total} vote{"s" if total != 1 else ""} total', cls='total'),
-        *[render_option(opt, vote_counts.get(opt[OPT_ID], 0), total)
+        *[render_option(opt, counts.get(opt[OPT_ID], 0), total)
           for opt in options],
     )
 
@@ -377,17 +357,14 @@ def render_new_poll_form():
         )('Create Poll'),
     )
 
-async def render_app(db):
-    """Render the full #app — called on every DB change."""
-    polls   = await query(db, "SELECT * FROM polls ORDER BY id DESC LIMIT 20")
-    options = await query(db, "SELECT * FROM options ORDER BY poll_id, id")
-    vcounts = await query(db,
+def render_app(conn):
+    """Render the full #app from the database. Sync, fast."""
+    polls   = query(conn, "SELECT * FROM polls ORDER BY id DESC LIMIT 20")
+    options = query(conn, "SELECT * FROM options ORDER BY poll_id, id")
+    vcounts = query(conn,
         "SELECT option_id, COUNT(*) as cnt FROM votes GROUP BY option_id"
     )
 
-    # Build lookup structures
-    # options tuple: (id, poll_id, text, color)
-    # vcounts tuple: (option_id, cnt)
     opts_by_poll: dict = {}
     for opt in options:
         opts_by_poll.setdefault(opt[OPT_POLL_ID], []).append(opt)
@@ -413,7 +390,6 @@ def landing(initial_app):
         Datastar(),
     )
     b = body(
-        # SSE init on stable element outside morph target
         div(id='sse-init', **{"data-init": "@get('/stream')"}),
         header(
             span('🗳️'),
@@ -425,68 +401,71 @@ def landing(initial_app):
     )
     return html_doc(h, b)
 
-# ── Write helpers (run in APSW worker thread) ─────────────────────────────────
+# ── DB write helpers (sync) ───────────────────────────────────────────────────
 
-def _do_vote(db, option_id: int):
-    with db:
-        db.execute("INSERT INTO votes(option_id) VALUES(?)", (option_id,))
+OPTION_COLORS = [
+    '#3b82f6','#f97316','#8b5cf6','#10b981',
+    '#e11d48','#f59e0b','#6366f1','#0ea5e9',
+]
 
-def _do_delete_poll(db, poll_id: int):
-    with db:
-        # CASCADE in schema deletes options and votes automatically
-        db.execute("DELETE FROM polls WHERE id=?", (poll_id,))
+def _do_vote(conn, option_id: int):
+    conn.execute("INSERT INTO votes(option_id) VALUES(?)", (option_id,))
 
-def _do_new_poll(db, question: str, opts: list[str]):
-    colors = ['#3b82f6','#f97316','#8b5cf6','#10b981',
-              '#e11d48','#f59e0b','#6366f1','#0ea5e9']
-    with db:
-        db.execute("INSERT INTO polls(question) VALUES(?)", (question,))
-        poll_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        for i, text in enumerate(opts):
-            db.execute(
-                "INSERT INTO options(poll_id, text, color) VALUES(?,?,?)",
-                (poll_id, text, colors[i % len(colors)]),
-            )
+def _do_delete_poll(conn, poll_id: int):
+    conn.execute("DELETE FROM polls WHERE id=?", (poll_id,))
 
-# ── App ───────────────────────────────────────────────────────────────────────
+def _do_new_poll(conn, question: str, opts: list[str]):
+    conn.execute("INSERT INTO polls(question) VALUES(?)", (question,))
+    poll_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    for i, text in enumerate(opts):
+        conn.execute(
+            "INSERT INTO options(poll_id, text, color) VALUES(?,?,?)",
+            (poll_id, text, OPTION_COLORS[i % len(OPTION_COLORS)]),
+        )
 
-# Module-level state
+# ── Module-level state ────────────────────────────────────────────────────────
+
 db    = None
 relay = None
 _ready = asyncio.Event()
 
-async def startup(loop):
+def startup(loop):
     global db, relay
     try:
-        db    = await create_db("poll.db")
-        relay = await create_db_relay(db)
-        await migrate(db, SCHEMA)
-        await db.async_run(_seed_sync, db)
+        db    = create_db("poll.db")
+        relay = create_db_relay(
+            db, loop,
+            render_fn=lambda: patch_elements(render_app(db)),
+        )
+        migrate(db, SCHEMA)
+        seed(db)
         print('[startup] db ready')
     except Exception:
         import traceback
         traceback.print_exc()
     finally:
-        # Always set _ready so handlers don't hang forever.
-        # If startup failed, db/relay are None and handlers will 500.
-        _ready.set()
+        loop.call_soon_threadsafe(_ready.set)
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = create_app(on_init=startup)
 
 @app.get('/')
 async def index(req):
     await _ready.wait()
-    initial = await render_app(db)
-    return landing(initial)
+    return landing(render_app(db))
 
 @app.get('/stream')
 async def stream(req):
     await _ready.wait()
     print('[/stream] client connected')
     async def _stream():
-        yield patch_elements(await render_app(db))
-        async for _table, _rowid in relay.subscribe():
-            yield patch_elements(await render_app(db))
+        # Initial state — rendered once for this client
+        yield patch_elements(render_app(db))
+        # All subsequent updates — pre-rendered once, shared by all clients
+        async for event_str in relay.broadcaster.subscribe():
+            if event_str:
+                yield event_str
     return _stream()
 
 @app.post('/vote')
@@ -494,31 +473,10 @@ async def vote(req):
     await _ready.wait()
     option_id = int(req['query'].get('option_id', 0))
     if option_id:
-        await write(db, _do_vote, db, option_id)
+        write(db, _do_vote, option_id)
         print(f'[/vote] option {option_id}')
     async def _stream():
-        yield patch_signals({})   # nothing to clear — no input fields
-    return _stream()
-
-@app.post('/new-poll')
-async def new_poll(req):
-    await _ready.wait()
-    data     = await signals(req)
-    question = (data.get('question') or '').strip()
-    opts     = [
-        (data.get(f'opt{i}') or '').strip()
-        for i in range(4)
-    ]
-    opts = [o for o in opts if o]   # drop blank options
-
-    if question and len(opts) >= 2:
-        await write(db, _do_new_poll, db, question, opts)
-        print(f'[/new-poll] {question!r} with {len(opts)} options')
-
-    async def _stream():
-        # Clear the form signals
-        yield patch_signals({'question': '', 'opt0': '', 'opt1': '',
-                             'opt2': '', 'opt3': ''})
+        yield patch_signals({})
     return _stream()
 
 @app.post('/delete-poll')
@@ -526,14 +484,29 @@ async def delete_poll(req):
     await _ready.wait()
     poll_id = int(req['query'].get('poll_id', 0))
     if poll_id:
-        await write(db, _do_delete_poll, db, poll_id)
+        write(db, _do_delete_poll, poll_id)
         print(f'[/delete-poll] poll {poll_id}')
     async def _stream():
         yield patch_signals({})
+    return _stream()
+
+@app.post('/new-poll')
+async def new_poll(req):
+    await _ready.wait()
+    data     = await signals(req)
+    question = (data.get('question') or '').strip()
+    opts     = [(data.get(f'opt{i}') or '').strip() for i in range(4)]
+    opts     = [o for o in opts if o]
+    if question and len(opts) >= 2:
+        write(db, _do_new_poll, question, opts)
+        print(f'[/new-poll] {question!r} with {len(opts)} options')
+    async def _stream():
+        yield patch_signals({'question':'','opt0':'','opt1':'','opt2':'','opt3':''})
     return _stream()
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     print('http://localhost:8000')
-    serve(app, host='0.0.0.0', port=8000)
+#    serve(app, host='0.0.0.0', port=8000)
+    serve(app, host='0.0.0.0', port=8000, backpressure=500)

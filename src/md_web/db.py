@@ -1,43 +1,48 @@
 """
-md_web.db — async SQLite via APSW
-===================================
-Single async path. No sync fallback. No footguns.
+md_web.db — SQLite via APSW (sync connection, async pub/sub)
+=============================================================
+Philosophy
+----------
+SQLite with WAL mode delivers ~70,000 reads/sec and ~3,600 writes/sec.
+For the vast majority of web applications this is never the bottleneck.
+Async DB wrappers add complexity without benefit at these speeds.
+
+This module uses a plain sync APSW connection for all DB operations.
+The only async concern is signalling the SSE layer when data changes —
+handled by a single asyncio.Event via call_soon_threadsafe.
 
 Public surface
 --------------
-    create_db(path)         → async, returns apsw async Connection
-    migrate(db, sql)        → async, idempotent schema application
-    create_db_relay(db)     → async, returns DbRelay
-    query(db, sql, ...)     → async, safe SELECT with limits
+    create_db(path)          → apsw.Connection, WAL + best practices
+    migrate(conn, sql)       → idempotent schema, sync
+    query(conn, sql, ...)    → list of tuples, sync
+    write(conn, fn, *args)   → run fn(conn, *args) in a transaction, sync
+    create_db_relay(conn, loop) → DbRelay with subscribe() + broadcaster
 
-All functions are coroutines. Call them with await. Always.
+Pattern
+-------
+    # startup (sync — call from on_init via loop.run_until_complete)
+    db    = create_db("app.db")
+    relay = create_db_relay(db, loop)
+    migrate(db, SCHEMA)
 
-How the relay works
--------------------
-APSW's async connection supports an async update_hook that fires
-directly in the asyncio event loop — no call_soon_threadsafe,
-no threading, no shared mutable state across thread boundaries.
+    # write handler
+    @app.post("/vote")
+    async def vote(req):
+        write(db, lambda c: c.execute("INSERT INTO votes ..."))
+        # update_hook fires, relay renders once, broadcasts to all streams
+        async def _stream():
+            yield patch_signals({})
+        return _stream()
 
-The broadcast-future pattern gives zero-latency wakeups with no
-lost notifications:
-
-    INSERT row
-        │
-        └─ async update_hook fires in event loop
-                │
-                └─ _notify():
-                       old_event  = self._event
-                       self._event = asyncio.Event()   # next round
-                       old_event.set()                 # wake all waiters
-                              │
-                    all subscribers wake, each reads
-                    WHERE id > their own cursor,
-                    advances cursor, yields new rows,
-                    goes back to await self._event.wait()
-
-Two rapid writes before any subscriber wakes? Both are caught on
-the next wait() — subscribers read all rows past their cursor in
-one query. No wakeup is ever lost.
+    # stream handler
+    @app.get("/stream")
+    async def stream(req):
+        async def _stream():
+            yield relay.broadcaster.current()  # initial state
+            async for event_str in relay.broadcaster.subscribe():
+                yield event_str
+        return _stream()
 
 Requires
 --------
@@ -47,231 +52,229 @@ Requires
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
-from typing import Any
-
-log = logging.getLogger(__name__)
+import threading
+from typing import Any, Callable
 
 import apsw
-import apsw.aio
 import apsw.bestpractice
 import apsw.ext
 
-# Apply best practices once at import time.
-# Sets WAL, foreign keys, synchronous=NORMAL, recursive triggers,
-# mmap, cache size — the recommended defaults for every app.
+log = logging.getLogger(__name__)
+
+# Apply recommended settings once at import time:
+# WAL, foreign keys, synchronous=NORMAL, recursive triggers, mmap, cache
 apsw.bestpractice.apply(apsw.bestpractice.recommended)
-apsw.ext.log_sqlite()  # forward SQLite internal logs to Python logging
+apsw.ext.log_sqlite()
 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
-async def create_db(path: str) -> "apsw.Connection":
-    """Open (or create) an async SQLite connection with best practices applied.
+def create_db(path: str) -> apsw.Connection:
+    """Open (or create) a SQLite connection with best practices applied.
 
-    Returns an APSW async connection. All operations on it must be awaited.
-    Rows are returned as frozen dataclasses so render functions can use
-    ``row.name``, ``row.text`` etc. instead of ``row[0]``, ``row[1]``.
+    WAL mode, foreign keys, synchronous=NORMAL — all set by bestpractice.
+    Returns a plain sync apsw.Connection. Fast, simple, no async wrapper.
 
-    Call from ``on_init``::
+    Call from on_init::
 
-        async def startup(loop):
+        def startup(loop):
             global db, relay
-            db    = await create_db("chat.db")
-            relay = await create_db_relay(db)
-            await migrate(db, SCHEMA)
+            db    = create_db("app.db")
+            relay = create_db_relay(db, loop)
+            migrate(db, SCHEMA)
 
         app = create_app(on_init=startup)
     """
-    db = await apsw.Connection.as_async(path)
-    await db.pragma("journal_mode", "wal")
-
+    conn = apsw.Connection(path)
+    conn.pragma("journal_mode", "wal")
     log.debug("db opened: %s", path)
-    return db
+    return conn
 
 
-# ── Migration ─────────────────────────────────────────────────────────────────
+# ── Schema ────────────────────────────────────────────────────────────────────
 
-async def migrate(db: "apsw.Connection", schema_sql: str) -> None:
-    """Apply a schema idempotently. Safe to call on every startup.
+def migrate(conn: apsw.Connection, schema_sql: str) -> None:
+    """Apply schema idempotently. Use CREATE TABLE IF NOT EXISTS.
 
-    Use ``CREATE TABLE IF NOT EXISTS`` and ``CREATE INDEX IF NOT EXISTS``
-    in your schema SQL so re-runs are no-ops::
+    Safe to call on every startup::
 
-        await migrate(app.db, '''
+        migrate(db, '''
             CREATE TABLE IF NOT EXISTS messages (
-                id    INTEGER PRIMARY KEY,
-                name  TEXT    NOT NULL,
-                text  TEXT    NOT NULL,
-                color TEXT    NOT NULL,
-                ts    REAL    NOT NULL DEFAULT (unixepoch('now','subsec'))
+                id   INTEGER PRIMARY KEY,
+                text TEXT NOT NULL,
+                ts   REAL NOT NULL DEFAULT (unixepoch('now','subsec'))
             );
-            CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
         ''')
     """
-    async with db:
-        await db.execute(schema_sql)
+    with conn:
+        conn.execute(schema_sql)
     log.debug("migration applied")
+
+
+# ── Query helpers ─────────────────────────────────────────────────────────────
+
+def query(
+    conn: apsw.Connection,
+    sql: str,
+    bindings: tuple = (),
+    *,
+    limit: int = 1000,
+) -> list[tuple]:
+    """Execute a SELECT, return plain tuples, capped at limit rows.
+
+    Sync — runs directly in the calling thread. At SQLite WAL speeds
+    (~70k reads/sec) this is microseconds, not a blocking concern.
+
+        rows = query(db, "SELECT * FROM messages ORDER BY id DESC LIMIT 50")
+        for row in rows:
+            row[0]  # id
+            row[1]  # text
+    """
+    rows = []
+    for row in conn.execute(sql, bindings):
+        rows.append(row)
+        if len(rows) >= limit:
+            log.debug("query: row limit %d hit", limit)
+            break
+    return rows
+
+
+def write(
+    conn: apsw.Connection,
+    fn: Callable,
+    *args: Any,
+) -> Any:
+    """Run fn(conn, *args) inside a transaction.
+
+    The update_hook fires after commit — no manual relay.publish() needed.
+
+        write(db, lambda c: c.execute(
+            "INSERT INTO messages(text) VALUES(?)", (text,)
+        ))
+    """
+    with conn:
+        return fn(conn, *args)
+
+
+# ── Broadcaster ───────────────────────────────────────────────────────────────
+
+class Broadcaster:
+    """
+    Pre-renders once per DB write, fans out the same string to all streams.
+
+    On every DB write:
+      1. render_fn() called ONCE  → SSE event string
+      2. string cached
+      3. asyncio.Event set        → all N subscribers wake, read cache
+
+    Per-subscriber work per update:
+      - one attribute read (_cached)
+      - yield the string (framework handles brotli per-client)
+
+    Total renders per write: 1, regardless of N connected clients.
+    """
+
+    def __init__(self, render_fn: Callable[[], str]):
+        self._render_fn = render_fn
+        self._cached: str | None = None
+        self._event = asyncio.Event()
+
+    def _notify(self) -> None:
+        """Called from update_hook (sync thread) via call_soon_threadsafe."""
+        try:
+            self._cached = self._render_fn()
+        except Exception:
+            log.exception("Broadcaster: render_fn raised")
+            self._cached = None
+        # Broadcast-future pattern: replace event, set old one
+        old          = self._event
+        self._event  = asyncio.Event()
+        old.set()
+
+    def current(self) -> str | None:
+        """Return the last rendered SSE string (for initial client state)."""
+        return self._cached
+
+    async def subscribe(self):
+        """Yield pre-rendered SSE strings on every DB write.
+
+        All subscribers receive the same cached string object — zero
+        per-subscriber rendering::
+
+            async for event_str in relay.broadcaster.subscribe():
+                if event_str:
+                    yield event_str
+        """
+        try:
+            while True:
+                await self._event.wait()
+                yield self._cached
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
 
 
 # ── Relay ─────────────────────────────────────────────────────────────────────
 
 class DbRelay:
     """
-    SSE relay backed by SQLite's async update_hook.
+    Connects SQLite's sync update_hook to asyncio SSE streams.
 
-    The hook fires directly in the asyncio event loop — no threading,
-    no call_soon_threadsafe. The broadcast-future pattern ensures
-    zero lost wakeups even under rapid writes.
-
-    Identical subscribe/publish interface to the in-memory relay so
-    SSE handlers need no changes when switching to a DB-backed relay.
+    The update_hook fires synchronously in SQLite's thread after every
+    INSERT/UPDATE/DELETE. We hand off to the event loop via
+    call_soon_threadsafe — one call that renders once and wakes all streams.
     """
 
-    def __init__(self, db: "apsw.Connection"):
-        self._db     = db
-        self._event  = asyncio.Event()   # current broadcast future
+    def __init__(
+        self,
+        conn: apsw.Connection,
+        loop: asyncio.AbstractEventLoop,
+        render_fn: Callable[[], str] | None = None,
+    ):
+        self._conn       = conn
+        self._loop       = loop
+        self.broadcaster = Broadcaster(render_fn or (lambda: ""))
+        conn.set_update_hook(self._on_db_write)
+        log.debug("DbRelay: update_hook installed")
 
-    def _notify(self) -> None:
-        """Replace the current event and set the old one.
+    def _on_db_write(
+        self,
+        op_type: int,
+        db_name: str,
+        table_name: str,
+        rowid: int,
+    ) -> None:
+        """Fires synchronously after every DB write. Must be fast."""
+        self._loop.call_soon_threadsafe(self.broadcaster._notify)
 
-        Called from the async update_hook — already in the event loop.
-        """
-        old          = self._event
-        self._event  = asyncio.Event()
-        old.set()
+    def set_render_fn(self, render_fn: Callable[[], str]) -> None:
+        """Set or replace the render function after construction."""
+        self.broadcaster._render_fn = render_fn
 
-    async def _install_hook(self) -> None:
-        """Wire up the async update_hook."""
-        async def _hook(
-            op_type: int,
-            db_name: str,
-            table_name: str,
-            rowid: int,
-        ) -> None:
-            self._notify()
-
-        await self._db.set_update_hook(_hook)
-        log.debug("DbRelay: async update_hook installed")
-
-    def publish(self, _topic: str = "*", _data: Any = None) -> None:
-        """Manually trigger a notification.
-
-        Normally the update_hook fires automatically after any write.
-        Use this after bulk imports or external writes that bypass the
-        hook (e.g. ATTACH, SQLite CLI changes).
-        """
-        self._notify()
-
-    async def subscribe(self, table: str = "*"):
-        """Async generator — yields ``(table, rowid)`` on every DB change.
-
-        Waits on the broadcast future. When the future fires, yields once
-        and immediately sets up the next wait. The caller is responsible
-        for querying the DB to find what changed::
-
-            async for table, rowid in relay.subscribe("messages"):
-                rows = await query(db,
-                    "SELECT * FROM messages WHERE id > ? ORDER BY id",
-                    (last_id,),
-                )
-                if rows:
-                    last_id = rows[-1].id
-                    yield patch_elements(render(rows))
-        """
-        try:
-            while True:
-                await self._event.wait()
-                yield (table, -1)
-        except (asyncio.CancelledError, GeneratorExit):
-            pass
-
-    async def close(self) -> None:
+    def close(self) -> None:
         """Remove the update_hook."""
-        await self._db.set_update_hook(None)
+        self._conn.set_update_hook(None)
         log.debug("DbRelay: update_hook removed")
 
 
-async def create_db_relay(db: "apsw.Connection") -> DbRelay:
-    """Create a DbRelay wired to *db*'s async update_hook.
+def create_db_relay(
+    conn: apsw.Connection,
+    loop: asyncio.AbstractEventLoop,
+    render_fn: Callable[[], str] | None = None,
+) -> DbRelay:
+    """Create a DbRelay wired to conn's update_hook.
 
-    Must be called after ``create_db()``::
+    render_fn is a sync callable that returns the SSE event string.
+    It is called once per DB write before any subscriber wakes up.
+    Pass it here or set it later with relay.set_render_fn().
 
-        async def startup(loop):
-            app.db    = await create_db("app.db")
-            app.relay = await create_db_relay(app.db)
-            await migrate(app.db, SCHEMA)
+    Call from on_init — the loop argument is the one passed by Granian::
 
-        app = create_app(on_init=startup)
+        def startup(loop):
+            global db, relay
+            db    = create_db("app.db")
+            relay = create_db_relay(db, loop)
+            migrate(db, SCHEMA)
+            relay.set_render_fn(lambda: patch_elements(render_app(db)))
     """
-    relay = DbRelay(db)
-    await relay._install_hook()
-    return relay
-
-
-# ── Safe query helper ─────────────────────────────────────────────────────────
-
-async def query(
-    db: "apsw.Connection",
-    sql: str,
-    bindings: tuple = (),
-    *,
-    limit: int = 1000,
-) -> list:
-    """Execute a SELECT safely, capped at *limit* rows.
-
-    Returns a list of plain tuples. Use index access: row[0], row[1].
-    Never raises on row-limit breach — returns partial results with a
-    debug log. Use for all read queries in SSE handlers::
-
-        messages = await query(db,
-            "SELECT * FROM messages ORDER BY ts DESC LIMIT ?",
-            (50,),
-        )
-        for row in reversed(messages):
-            # row[0]=id, row[1]=name, row[2]=text ...
-            ...
-    """
-    rows = []
-    cursor = await db.execute(sql, bindings)
-    async for row in cursor:
-        rows.append(row)
-        if len(rows) >= limit:
-            log.debug("query: row limit %d hit, truncating", limit)
-            break
-    return rows
-
-
-# ── Batch write helper ────────────────────────────────────────────────────────
-
-async def write(
-    db: "apsw.Connection",
-    fn,
-    *args,
-    **kwargs,
-) -> Any:
-    """Run a write function in the APSW worker thread.
-
-    Wraps ``db.async_run()`` with an automatic transaction. Use for
-    any write that touches multiple rows or tables — all ops complete
-    atomically in a single worker-thread call, one round-trip::
-
-        async def _insert_and_trim(db, name, text, color):
-            with db:   # transaction
-                db.execute(
-                    "INSERT INTO messages(name,text,color) VALUES(?,?,?)",
-                    (name, text, color),
-                )
-                db.execute(
-                    "DELETE FROM messages WHERE id NOT IN "
-                    "(SELECT id FROM messages ORDER BY id DESC LIMIT 200)"
-                )
-            return db.execute("SELECT MAX(id) FROM messages").fetchone()[0]
-
-        max_id = await write(app.db, _insert_and_trim, db, name, text, color)
-
-    The update_hook fires automatically after the transaction commits.
-    No manual relay.publish() needed.
-    """
-    return await db.async_run(fn, *args, **kwargs)
+    return DbRelay(conn, loop, render_fn)

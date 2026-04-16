@@ -91,6 +91,7 @@ from .db import (
     query as db_query,
     write as db_write,
     DbRelay,
+    Broadcaster,
 )
 
 __all__ = [
@@ -109,7 +110,8 @@ __all__ = [
     # tunnel
     "TunnelState", "load_env", "start_tunnel", "stop_tunnel",
     # db
-    "create_db", "create_db_relay", "migrate", "db_query", "db_write", "DbRelay",
+    "create_db", "create_db_relay", "migrate",
+    "db_query", "db_write", "DbRelay", "Broadcaster",
 ]
 
 
