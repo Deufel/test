@@ -220,9 +220,13 @@ def create_broadcaster(relay, render_fn, *, topic: str = "broadcast"):
     import zlib
 
     def push():
-        event_str  = render_fn()                        # render once
-        compressed = _gzip_compress(event_str.encode()) # compress once
-        relay.broadcast(topic, compressed)              # fan out bytes
+        event_str = render_fn()                  # render once
+        relay.broadcast(topic, event_str)        # fan out — str, not bytes
+        # Note: we broadcast the plain SSE string, not compressed bytes.
+        # Each client's per-stream compressor (brotli or gzip) handles
+        # encoding. The O(1) win is the render — we call render_fn() once
+        # regardless of N. Compression is still O(N) but that cost lives
+        # in Rust I/O, not Python GIL.
 
     class _Broadcaster:
         __slots__ = ("push", "topic")
