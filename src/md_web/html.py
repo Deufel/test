@@ -128,7 +128,7 @@ def render(node, ns='html', depth=0, indent=2):
         return f'{pad}<{tag}{attr_str} />' if self_close else f'{pad}<{tag}{attr_str}>'
     if tag in RAW:
         return f'{pad}<{tag}{attr_str}>{"".join(str(c) for c in children)}</{tag}>'
-    if len(children) == 1 and not isinstance(children[0], Tag):
+    if len(children) == 1 and not isinstance(children[0], (Tag, Safe)):
         return f'{pad}<{tag}{attr_str}>{escape(str(children[0]))}</{tag}>'
 
     inner = '\n'.join(render(c, new_ns, depth + 1, indent) for c in children)
