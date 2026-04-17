@@ -1,342 +1,225 @@
 /*
   md_web.ui — component stylesheet
   =================================
-  Depends on: the design-system CSS being loaded first.
+  Loads after the design system CSS.
 
-  Color rule: .surface is applied ONCE per component — on the outermost
-  wrapper only. Child elements must never carry .surface or any background
-  class. They inherit text color from the surface context and must remain
-  background-transparent so the card reads as a single unified surface.
+  Design contract
+  ---------------
+  This file owns STRUCTURE only: layout, flex direction, overflow,
+  display mode, and semantic --type / --contrast adjustments.
+
+  It does NOT own:
+    - background or color values  → .surface cascade + currentColor
+    - font-family                 → --font-* from design system :root
+    - font-size                   → --type custom property (design system scale)
+    - opacity / contrast          → --contrast custom property
+    - border color                → var(--border) / var(--Border)
+    - border-radius               → var(--cfg-radius)
+    - gap / spacing               → var(--_s) from --space
+
+  Surface rule
+  ------------
+  .surface appears ONCE per component — on the outermost wrapper only.
+  Every child has background: transparent. The design system's :has()
+  depth model handles nested surface lightness automatically.
 */
 
-/* ── Stat card ────────────────────────────────────────────────────────────── */
-
-.stat-card {
-  display:        flex;
-  flex-direction: column;
-  gap:            0.5rem;
-  /* No surface/background — provided by parent card() wrapper */
-}
-
-/* Children stay transparent — no rogue backgrounds */
-.stat-card *,
-.stat-card *::before,
-.stat-card *::after {
-  background: transparent;
-}
-
-.stat-header {
-  display:         flex;
-  align-items:     center;
-  justify-content: space-between;
-  gap:             0.5rem;
-}
-
-.stat-label {
-  letter-spacing: 0.06em;
-  /* color: inherit from surface — auto-contrast handled by design system */
-}
-
-.stat-delta {
-  font-family:         var(--font-mono, monospace);
-  font-size:           0.72em;
-  font-weight:         600;
-  white-space:         nowrap;   /* arrow + pct always on one line */
-  flex-shrink:         0;        /* never compress in flex header row */
-  font-variant-numeric: tabular-nums;
-  /* color is set inline by Python delta_color() as an OKLCH value */
-}
-
-.stat-value {
-  font-family:          var(--font-heading, sans-serif);
-  font-size:            1.75rem;
-  font-weight:          400;
-  line-height:          1;
-  letter-spacing:       -0.02em;
-  font-variant-numeric: tabular-nums;  /* digits stay fixed-width during live updates */
-  /* color: inherit — flows from .surface auto-contrast on card wrapper */
-}
-
-.stat-sparkline {
-  display:  block;
-  width:    100%;
-  height:   auto;
-  overflow: visible; /* dot stroke must not clip at SVG edge */
-}
-
-/* ── KPI row grid ─────────────────────────────────────────────────────────── */
-
-.kpi-row {
-  display:               grid;
-  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
-  gap:                   var(--_s, 1rem);
-}
-
-/* ── Activity heatmap ────────────────────────────────────────────────────── */
-
-.activity-heatmap-wrap {
-  display:        inline-flex;
-  flex-direction: column;
-  gap:            0.5rem;
-  /* No surface — provided by parent card() */
-}
-
-.activity-heatmap {
-  display:   block;
-  max-width: 100%;
-  overflow:  visible;
-}
-
-.heatmap-label {
-  display:        block;
-  letter-spacing: 0.06em;
-  opacity:        0.55;
-}
-
-/* ── Heatmap labels (rendered via foreignObject inside SVG) ──────────────
-   These are real HTML elements inside SVG coordinate space.
-   They inherit the full CSS cascade — font, color, design tokens —
-   exactly like any other HTML element on the page.              ──────── */
-
-.hm-dow-label,
-.hm-month-label,
-.hm-legend-label {
-  font-family: var(--font-body);
-  font-size:   0.6rem;
-  line-height: 1;
-  color:       currentColor;
-  opacity:     0.5;
-  white-space: nowrap;
-  display:     flex;
-  align-items: center;
-}
-
-.hm-dow-label {
-  height:      100%;
-  justify-content: flex-end;   /* right-align against the grid */
-  padding-right: 3px;
-}
-
-.hm-month-label {
-  height:      100%;
-  align-items: flex-end;       /* sit at the bottom of the top margin */
-  padding-bottom: 2px;
-}
-
-.hm-legend-label {
-  height:      100%;
-  align-items: center;
-}
 
 /* ══════════════════════════════════════════════════════════════════════════
-   Layout primitives: card, grid, section
+   card / grid / section
    ══════════════════════════════════════════════════════════════════════════ */
-
-/* ── card ──────────────────────────────────────────────────────────────── */
 
 .ui-card {
   display:        flex;
   flex-direction: column;
-  gap:            0.75rem;
+  gap:            var(--_s, 0.75rem);
   padding:        1.25rem;
-  border-radius:  var(--cfg-radius, 8px);
+  border-radius:  var(--cfg-radius);
   border:         1px solid var(--border);
-  min-width:      0;        /* allow shrinking inside grid */
+  min-width:      0;
 }
 
-/* Padding variants */
 .ui-card.card--pad-sm   { padding: 0.75rem; }
 .ui-card.card--pad-lg   { padding: 2rem; }
 .ui-card.card--pad-none { padding: 0; border: none; }
 
-/* Children transparent — surface on wrapper only */
 .ui-card *,
 .ui-card *::before,
 .ui-card *::after { background: transparent; }
 
-.card-header {
-  display:        flex;
-  flex-direction: column;
-  gap:            0.2rem;
-}
+.card-header { display: flex; flex-direction: column; gap: 0.2rem; }
 
-.card-title {
-  font-size:      0.9rem;
-  font-weight:    600;
-  letter-spacing: 0.01em;
-  line-height:    1.2;
-}
-
-.card-subtitle {
-  font-size:   0.72rem;
-  opacity:     0.5;
-  font-family: var(--font-mono, monospace);
-  letter-spacing: 0.04em;
-}
+.card-title    { --type: 1; --contrast: 0.9; font-family: var(--font-heading); letter-spacing: 0.01em; }
+.card-subtitle { --type: -1.5; --contrast: 0.5; font-family: var(--font-mono); letter-spacing: 0.04em; }
 
 .card-body {
-  flex:       1;
-  min-width:  0;
-  display:    flex;
-  flex-direction: column;
+  flex: 1; min-width: 0;
+  display: flex; flex-direction: column;
 }
 
-/* SVG charts fill their card body */
+/* Charts inside cards fill available height */
 .card-body .bar-chart,
-.card-body .bar-chart-svg,
-.card-body .activity-heatmap-wrap {
-  flex: 1;
-}
+.card-body .line-chart,
+.card-body .scatter-plot,
+.card-body .bubble-map,
+.card-body .activity-heatmap-wrap { flex: 1; }
 
-/* ── grid ──────────────────────────────────────────────────────────────── */
+/* ── grid ─────────────────────────────────────────────────────────────── */
 
 .ui-grid {
-  display:               grid;
+  display: grid;
   grid-template-columns: repeat(auto-fit, minmax(var(--grid-min-w, 280px), 1fr));
-  gap:                   var(--_s, 1rem);
-  align-items:           start;
+  gap: var(--_s, 1rem);
+  align-items: start;
 }
 
-/* Fixed grids (chart rows) stretch cards to equal height */
-.ui-grid[style*="repeat("] {
-  align-items: stretch;
-}
+.ui-grid[style*="repeat("] { align-items: stretch; }
+.ui-grid.grid--gap-sm      { gap: 0.5rem; }
+.ui-grid.grid--gap-lg      { gap: 1.5rem; }
 
-.ui-grid.grid--gap-sm { gap: 0.5rem; }
-.ui-grid.grid--gap-lg { gap: 1.5rem; }
+/* ── section ──────────────────────────────────────────────────────────── */
 
-/* ── section ───────────────────────────────────────────────────────────── */
-
-.ui-section {
-  display:        flex;
-  flex-direction: column;
-  gap:            1rem;
-}
+.ui-section { display: flex; flex-direction: column; gap: 1rem; }
 
 .section-header {
-  display:        flex;
-  flex-direction: column;
-  gap:            0.2rem;
+  display: flex; flex-direction: column; gap: 0.2rem;
   padding-bottom: 0.5rem;
-  border-bottom:  1px solid var(--border);
+  border-bottom: 1px solid var(--border);
 }
 
-.section-title {
-  font-size:      1rem;
-  font-weight:    600;
-  font-family:    var(--font-heading, sans-serif);
-  letter-spacing: 0.01em;
-}
+.section-title    { --type: 2; --contrast: 0.95; font-family: var(--font-heading); }
+.section-subtitle { --type: -1; --contrast: 0.55; }
 
-.section-subtitle {
-  font-size: 0.8rem;
-  opacity:   0.55;
-}
 
 /* ══════════════════════════════════════════════════════════════════════════
-   Bar chart
+   Stat card
    ══════════════════════════════════════════════════════════════════════════ */
 
-.bar-chart {
-  display:        flex;
-  flex-direction: column;
-  gap:            0.4rem;
-  min-width:      0;
+.stat-card { display: flex; flex-direction: column; gap: 0.5rem; }
+.stat-card *, .stat-card *::before, .stat-card *::after { background: transparent; }
+
+.stat-header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+
+.stat-label  { --type: -1.5; --contrast: 0.6; letter-spacing: 0.06em; }
+.stat-delta  {
+  --type: -1.5; --contrast: 0.85;
+  font-family: var(--font-mono); font-weight: 600;
+  white-space: nowrap; flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  /* color overridden inline from Python delta_color() */
 }
-
-.bar-chart-svg {
-  display:   block;
-  width:     100%;
-  height:    auto;
-  overflow:  visible;
-}
-
-/* Title sits above the SVG */
-.bc-title {
-  display:        block;
-  font-size:      0.72rem;
-  font-family:    var(--font-mono, monospace);
-  letter-spacing: 0.06em;
-  opacity:        0.5;
-  text-transform: uppercase;
-}
-
-/* ── Bar chart label classes (rendered via foreignObject) ──────────────── */
-
-/* Vertical chart: x-axis category labels */
-.bc-xlabel {
-  font-size:   0.65rem;
-  font-family: var(--font-body, sans-serif);
-  color:       currentColor;
-  opacity:     0.6;
-  text-align:  center;
-  display:     flex;
-  align-items: flex-start;
-  justify-content: center;
-  line-height: 1.2;
-  overflow:    hidden;
-}
-
-/* Vertical chart: y-axis tick labels */
-.bc-ytick {
-  font-size:            0.62rem;
-  font-family:          var(--font-mono, monospace);
-  color:                currentColor;
-  opacity:              0.5;
-  text-align:           right;
-  display:              flex;
-  align-items:          center;
-  justify-content:      flex-end;
-  padding-right:        4px;
+.stat-value  {
+  font-family: var(--font-heading);
+  font-size: 1.75rem; font-weight: 400;
+  line-height: 1; letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
+.stat-sparkline { display: block; width: 100%; height: auto; overflow: visible; }
 
-/* Horizontal chart: y-axis category labels */
-.bc-ylabel {
-  font-size:       0.65rem;
-  font-family:     var(--font-body, sans-serif);
-  color:           currentColor;
-  opacity:         0.6;
-  text-align:      right;
-  display:         flex;
-  align-items:     center;
-  justify-content: flex-end;
-  padding-right:   6px;
-  overflow:        hidden;
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Activity heatmap
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.activity-heatmap-wrap { display: inline-flex; flex-direction: column; gap: 0.5rem; }
+.activity-heatmap      { display: block; max-width: 100%; overflow: visible; }
+
+.heatmap-label { --type: -1.5; --contrast: 0.55; display: block; letter-spacing: 0.06em; }
+
+/* All three heatmap foreignObject label classes share the same base */
+.hm-dow-label,
+.hm-month-label,
+.hm-legend-label {
+  --type: -2; --contrast: 0.5;
+  font-family: var(--font-body);
+  display: flex; white-space: nowrap;
+}
+.hm-dow-label    { height: 100%; justify-content: flex-end; padding-right: 3px; align-items: center; }
+.hm-month-label  { height: 100%; align-items: flex-end; padding-bottom: 2px; }
+.hm-legend-label { height: 100%; align-items: center; font-variant-numeric: tabular-nums; }
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Chart shared patterns
+   All chart types use --type / --contrast for text; only layout differs.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Container */
+.bar-chart, .line-chart, .scatter-plot, .bubble-map {
+  display: flex; flex-direction: column; gap: 0.4rem; min-width: 0;
 }
 
-/* Horizontal chart: x-axis tick labels */
-.bc-xtick {
-  font-size:            0.62rem;
-  font-family:          var(--font-mono, monospace);
-  color:                currentColor;
-  opacity:              0.5;
-  text-align:           center;
-  display:              flex;
-  align-items:          flex-start;
-  justify-content:      center;
+/* SVG element */
+.bar-chart-svg, .line-chart-svg, .scatter-plot-svg, .bubble-map-svg {
+  display: block; width: 100%; height: auto; overflow: visible;
+}
+
+/* Chart title — mono muted uppercase small label */
+.bc-title, .lc-title, .sp-title, .bm-title {
+  --type: -1.5; --contrast: 0.5;
+  font-family: var(--font-mono);
+  letter-spacing: 0.06em; text-transform: uppercase; display: block;
+}
+
+/* Axis tick labels — mono, tabular, very muted */
+.bc-ytick, .bc-xtick,
+.lc-ytick,
+.sp-ytick, .sp-xtick,
+.sp-refline-label,
+.bm-legend-label {
+  --type: -2; --contrast: 0.45;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  display: flex; align-items: center;
 }
 
-/* Value labels on/above bars */
-.bc-vallabel {
-  font-size:            0.62rem;
-  font-family:          var(--font-mono, monospace);
-  color:                currentColor;
-  opacity:              0.75;
-  text-align:           center;
-  display:              flex;
-  align-items:          flex-end;
-  justify-content:      center;
-  font-variant-numeric: tabular-nums;
+/* Axis tick alignment variants */
+.bc-ytick, .lc-ytick, .sp-ytick { justify-content: flex-end; padding-right: 4px; }
+.bc-xtick, .sp-xtick             { justify-content: center; align-items: flex-start; }
+.sp-refline-label                { --contrast: 0.5; }
+.bm-legend-label                 { --contrast: 0.55; }
+
+/* Category / data labels — body font, readable */
+.bc-xlabel, .bc-ylabel,
+.lc-xlabel,
+.sp-point-label, .sp-axis-title, .sp-axis-title-y,
+.bm-bubble-label {
+  --type: -1.5; --contrast: 0.6;
+  font-family: var(--font-body);
+  display: flex;
 }
 
-.bc-vallabel--h {
-  font-size:            0.62rem;
-  font-family:          var(--font-mono, monospace);
-  color:                currentColor;
-  opacity:              0.75;
-  display:              flex;
-  align-items:          center;
+/* Alignment variants for category labels */
+.bc-xlabel   { align-items: flex-start; justify-content: center; line-height: 1.2; overflow: hidden; }
+.bc-ylabel   { align-items: center; justify-content: flex-end; padding-right: 6px; overflow: hidden; }
+.lc-xlabel   { align-items: flex-start; justify-content: center; overflow: hidden; }
+
+.sp-axis-title   { align-items: center; justify-content: center; --contrast: 0.45; }
+.sp-axis-title-y { align-items: center; justify-content: center; --contrast: 0.45;
+                   writing-mode: vertical-rl; text-orientation: mixed; }
+
+.sp-point-label  { align-items: flex-start; justify-content: center;
+                   white-space: nowrap; --contrast: 0.65; }
+
+.bm-bubble-label { align-items: flex-start; justify-content: center;
+                   white-space: nowrap; pointer-events: none; --contrast: 0.7; }
+
+/* Value labels on bars */
+.bc-vallabel, .bc-vallabel--h {
+  --type: -2; --contrast: 0.75;
+  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+  display: flex;
 }
+.bc-vallabel   { align-items: flex-end; justify-content: center; }
+.bc-vallabel--h { align-items: center; }
+
+/* Legend labels */
+.lc-legend, .sp-legend {
+  --type: -1.5; --contrast: 0.7;
+  font-family: var(--font-body);
+  display: flex; align-items: center;
+}
+
+/* Bubble map state paths */
+.bm-states path { transition: fill calc(var(--cfg-motion, 1) * 0.2s) ease; }

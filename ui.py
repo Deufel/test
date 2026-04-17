@@ -37,10 +37,12 @@ from md_web import (
 )
 from md_web.db import create_db, create_db_relay, migrate, query, write
 
-from md_web.ui.stat_card  import stat_card
-from md_web.ui.bar_chart  import bar_chart
-from md_web.ui.heatmap    import activity_heatmap
-from md_web.ui.layout     import card, grid, section
+from md_web.ui.stat_card   import stat_card
+from md_web.ui.bar_chart   import bar_chart
+from md_web.ui.line_chart  import line_chart
+from md_web.ui.scatter_plot import scatter_plot, ScatterPoint
+from md_web.ui.heatmap     import activity_heatmap
+from md_web.ui.layout      import card, grid, section
 
 # ── Page tags ─────────────────────────────────────────────────────────────────
 
@@ -81,9 +83,17 @@ CREATE TABLE IF NOT EXISTS daily (
     value    REAL
 );
 CREATE INDEX IF NOT EXISTS daily_day ON daily(day);
+CREATE TABLE IF NOT EXISTS cat_history (
+    id       INTEGER PRIMARY KEY,
+    slug     TEXT NOT NULL,
+    tick     INTEGER NOT NULL,
+    value    REAL NOT NULL,
+    UNIQUE(slug, tick)
+);
 """
 
 HISTORY_LEN = 24
+CAT_HISTORY_LEN = 20  # ticks of category history for line chart
 
 # ── Data definitions ──────────────────────────────────────────────────────────
 
@@ -158,6 +168,15 @@ def seed(conn):
             conn.executemany(
                 "INSERT OR IGNORE INTO daily(day,value) VALUES(?,?)", rows
             )
+    # Category history — seed with gentle random walk per category
+    if conn.execute("SELECT COUNT(*) FROM cat_history").fetchone()[0] == 0:
+        for slug, label, base in CATEGORY_DEFS:
+            for tick in range(CAT_HISTORY_LEN):
+                v = base * (1 + 0.04*math.sin(tick/4) + random.gauss(0, 0.012))
+                conn.execute(
+                    "INSERT OR IGNORE INTO cat_history(slug,tick,value) VALUES(?,?,?)",
+                    (slug, tick, v),
+                )
     print('[seed] done')
 
 # ── DB write helpers ──────────────────────────────────────────────────────────
@@ -211,6 +230,20 @@ def _tick(conn):
                 (next_d.isoformat(), val),
             )
 
+    # Append current category values as a new history tick
+    max_tick = conn.execute("SELECT MAX(tick) FROM cat_history").fetchone()[0] or 0
+    new_tick = max_tick + 1
+    for row in conn.execute("SELECT * FROM categories").fetchall():
+        conn.execute(
+            "INSERT OR IGNORE INTO cat_history(slug,tick,value) VALUES(?,?,?)",
+            (row[C_SLUG], new_tick, row[C_VALUE]),
+        )
+    # Keep only last CAT_HISTORY_LEN ticks
+    conn.execute(
+        "DELETE FROM cat_history WHERE tick <= ?",
+        (new_tick - CAT_HISTORY_LEN,),
+    )
+
 # ── Rendering ─────────────────────────────────────────────────────────────────
 
 def _delta(history):
@@ -262,7 +295,7 @@ def render_app(conn):
         grid(cols=2, fixed=True)(
             card('By Volume', subtitle='top 6 categories')(
                 bar_chart(
-                    top6,
+                    all_cats,
                     orientation='vertical',
                     color_hue=220,
                     value_fmt=lambda v: f'${v:.0f}B',
@@ -279,14 +312,100 @@ def render_app(conn):
                     h=240,
                 )
             ),
-            card('Current vs Previous', subtitle='grouped — top 5 categories', span=2)(
+
+        )
+    )
+
+    # ── Line chart: category trends over ticks ───────────────────────────
+    cat_hist_rows = query(conn,
+        "SELECT slug, tick, value FROM cat_history ORDER BY slug, tick"
+    )
+    # Build per-category series with readable relative labels
+    # Group by slug, sort by tick, then label as "–N ticks ago" → "now"
+    cat_by_slug: dict = {}
+    for row in cat_hist_rows:
+        cat_by_slug.setdefault(row[0], []).append((row[1], row[2]))
+
+    cat_series: dict = {}
+    for slug, tick_vals in cat_by_slug.items():
+        tick_vals.sort(key=lambda t: t[0])
+        n = len(tick_vals)
+        labeled = []
+        for i, (tick, val) in enumerate(tick_vals):
+            if i == n - 1:
+                lbl = 'now'
+            elif (n - 1 - i) % max(1, (n - 1) // 5) == 0:
+                lbl = f'–{n - 1 - i}'
+            else:
+                lbl = ''
+            labeled.append((lbl, val))
+        cat_series[slug] = labeled
+
+    # Show top 4 categories by current value as multi-series line chart
+    top4_slugs = [r[C_SLUG] for r in cat_rows[:4]]
+    line_data  = [
+        (dict(zip([d[0] for d in CATEGORY_DEFS],
+                  [d[1] for d in CATEGORY_DEFS])).get(slug, slug),
+         cat_series.get(slug, []))
+        for slug in top4_slugs
+        if cat_series.get(slug)
+    ]
+
+    trend_section = section('Category Trends', subtitle='top 4 categories · value by tick')(
+        card('Sales Over Time', subtitle='multi-series · smooth curves')(
+            line_chart(
+                line_data,
+                y_fmt       = lambda v: f'${v:.0f}B',
+                area        = True,
+                show_legend = True,
+                show_dots   = False,
+                h           = 220,
+                w           = 900,
+            )
+        )
+    )
+
+    # ── Scatter: category e-comm share vs sales volume ────────────────────
+    # E-comm category value as share of total = proxy for category e-comm mix
+    total_cat = sum(r[C_VALUE] for r in cat_rows) or 1
+    ecomm_val = next((r[C_VALUE] for r in cat_rows if r[C_SLUG] == 'ecomm'), 0)
+    # Give each category a synthetic e-comm share based on its mix with total
+    scatter_pts = [
+        ScatterPoint(
+            x     = round((r[C_VALUE] / total_cat) * 100 * random.gauss(1, 0.05), 2),
+            y     = round(r[C_VALUE], 1),
+            label = r[C_LABEL],
+            size  = r[C_VALUE],
+        )
+        for r in cat_rows
+    ]
+
+    scatter_section = section('Category Analysis')(
+        grid(cols=2, fixed=True)(
+            card('Size vs Share', subtitle='bubble size = sales volume')(
+                scatter_plot(
+                    scatter_pts,
+                    x_label     = 'Share of Total (%)',
+                    y_label     = 'Sales $B',
+                    x_fmt       = lambda v: f'{v:.1f}%',
+                    y_fmt       = lambda v: f'${v:.0f}B',
+                    show_labels = True,
+                    max_radius  = 18,
+                    h           = 260,
+                    ref_lines   = [
+                        {'axis': 'y', 'value': total_cat/len(cat_rows),
+                         'color': 'oklch(60% 0.12 220)', 'label': 'avg'},
+                    ],
+                )
+            ),
+            card('Current vs Previous', subtitle='grouped — top 5 categories', span=1)(
                 bar_chart(
                     yoy,
-                    orientation='vertical',
-                    value_fmt=lambda v: f'${v:.0f}B',
-                    show_values=True,
-                    h=200,
-                    w=760,
+                    orientation = 'vertical',
+                    value_fmt   = lambda v: f'${v:.0f}B',
+                    show_values = True,
+                    h           = 260,
+                    w           = 440,
                 )
             ),
         )
@@ -313,6 +432,8 @@ def render_app(conn):
     return div(id='app')(
         kpi_section,
         chart_section,
+        trend_section,
+        scatter_section,
         heatmap_section,
     )
 
@@ -336,8 +457,8 @@ PAGE_CSS = """
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-    --cfg-hue:          220;
-    --cfg-radius:       8px;
+    --cfg-hue:          254;
+    --cfg-radius:       4px;
     --cfg-top-l:        88;
     --cfg-base-step:    4;
     --cfg-curve-k:      0.6;
@@ -371,7 +492,7 @@ body {
     font-family:    var(--font-body);
     background:     oklch(90% 0.012 220);
     color:          oklch(25% 0.015 220);
-    min-height:     100dvh;
+    min-height:     100svh;
     display:        flex;
     flex-direction: column;
 }
@@ -432,10 +553,10 @@ def landing(conn):
         header(
             span('📈'),
             h1('md-web.ui — component library demo'),
-            small('stat_card · bar_chart · activity_heatmap · card · grid · section'),
+            small('stat_card · bar_chart · line_chart · scatter_plot · activity_heatmap · bubble_map'),
         ),
         main(render_app(conn)),
-        footer('md-web · Datastar · SQLite · SSE · brotli — open two windows to see multiplayer sync'),
+        footer('md-web.ui · stat_card · bar_chart · line_chart · scatter_plot · activity_heatmap · card · grid · section'),
     )
     return html_doc(h, b)
 
@@ -444,7 +565,7 @@ def landing(conn):
 async def tick_loop():
     await _ready.wait()
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(0.002)
         write(db, _tick)
 
 # ── Module state ──────────────────────────────────────────────────────────────
