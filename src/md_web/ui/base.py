@@ -58,7 +58,7 @@ class Color:
         text(fill=Color.fg)
     """
     # Surface backgrounds — inherit from nearest .surface ancestor
-    bg        = 'var(--_bg)'
+    bg        = 'var(--bg)'
     border    = 'var(--border)'
     Border    = 'var(--Border)'       # stronger border variant
 

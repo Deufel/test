@@ -3,137 +3,83 @@ md_web.ui.heatmap
 =================
 A GitHub-style 52-week × 7-day activity heatmap.
 
-Each cell represents one calendar day.  Value intensity is encoded
-as one of 5 discrete color steps — not a continuous ramp — which is
-easier to read at a glance and prints cleanly.
+Color is driven entirely through the design system's --color API.
 
-Color system
-------------
-Rather than hardcoding lightness values that break in light/dark mode,
-cell colors are expressed as OKLCH steps at fixed chroma and hue,
-with lightness chosen to sit clearly above the card surface in both
-themes.  The empty/no-data distinction uses the surface border token
-so it adapts automatically.
+  no activity    →  surface mode (no --color set)
+                    — covers both None (no data) and 0 (tracked zero).
+                    Visually identical; both mean "nothing happened here."
 
-  None    → var(--border)              no data — pipeline gap / weekend
-  step 0  → lowest lightness           data exists, near-zero value
-  step 1  → …
-  step 2  → …
-  step 3  → …
-  step 4  → highest lightness          maximum value
+  activity > 0   →  linear map of value → --color: 0..1, with percentile
+                    trimming at both ends. By default, values at/below
+                    the 5th percentile clamp to 0 and values at/above
+                    the 95th clamp to 1; the middle 90% gets the full
+                    scale to spread across.
 
-No hover-reveal / tooltip
---------------------------
-Value is communicated entirely through color.  Hiding data behind
-hover is bad visualization practice: it fails on print, fails on
-touch, and creates an invisible information layer.  The legend below
-the grid provides the color→value mapping.
+Why trim percentiles instead of using min/max? A few unusually small
+values (a weekend in a weekday-business, a dead holiday) drag the scale
+floor down and crush every typical day into the top sliver of the color
+range. A single huge value (Black Friday, a launch day) does the mirror
+damage from the top. Trimming both ends gives the middle 90% of data
+the full contrast range, which is usually what you actually want to see.
 
-Usage
------
-    from md_web.ui.heatmap import activity_heatmap
+Pass outlier_percentiles=(0, 100) to disable trimming and use pure
+min/max linear. Pass (5, 100) to trim only the low end.
 
-    activity_heatmap(
-        data=daily_revenue,        # {ISO-date-str: float | None}
-        label='Daily Revenue',
-        weeks=52,
-        color_hue=142,             # 142=green  220=blue  25=orange  280=purple
-        value_fmt=lambda v: f'${v:,.0f}',
-    )
+Zeros are excluded from the percentile computation and rendered as
+no-activity. This matches how humans read calendars: a day with zero
+activity is not "the dimmest active day," it's the absence of activity.
+
+Depends on the design system: core.css (--color, --bg, --border, --type,
+--contrast) and app.css (.stack composition class, small element defaults).
 """
 from __future__ import annotations
 
-import math
 from datetime import date, timedelta
-from typing import Callable, Dict, Optional
+from typing import Dict, Optional
 
 from md_web.html import mk_tag
-from .base import (
-    svg, g, rect,
-    div, span,
-    Color, Font, fmt_value,
-)
+from .base import svg, g, rect, div, Color
 
-# foreignObject bridges SVG coordinate space → HTML namespace
-# HTML children inherit the full CSS cascade (fonts, color, design tokens)
 foreign_object = mk_tag('foreignObject')
-
-small = mk_tag('small')
+small          = mk_tag('small')
 
 # ── Layout constants ──────────────────────────────────────────────────────────
-
-CELL    = 11          # cell size in SVG user units
-GAP     = 2           # gap between cells
-STEP    = CELL + GAP  # 13 units per cell + gap
-DOW_W   = 26          # left margin for Mon/Wed/Fri labels
-MONTH_H = 18          # top margin for month abbreviations
+CELL    = 11
+GAP     = 2
+STEP    = CELL + GAP
+DOW_W   = 26
+MONTH_H = 18
 
 MONTHS  = ['Jan','Feb','Mar','Apr','May','Jun',
            'Jul','Aug','Sep','Oct','Nov','Dec']
 
-# ── Discrete color steps ──────────────────────────────────────────────────────
-# Five steps from dim → bright, expressed as (lightness%, chroma_multiplier).
-# Lightness values are chosen to be clearly readable on a dark surface
-# AND a light surface — tested against both themes.
-#
-# The design system's surface background in dark mode is ~oklch(20-22% …),
-# in light mode ~oklch(82-84% …).  We need steps that contrast with both.
-#
-# Solution: use a fixed set of lightness values that work in dark mode,
-# and invert them in light mode via the CSS `prefers-color-scheme` cascade.
-# The Python side emits two parallel sets; CSS applies the right one.
-# Simpler: emit CSS custom properties for the 5 steps and reference them —
-# but that requires the CSS to know the hue.
-#
-# Practical solution for a Python-rendered SVG: emit the hue as a data
-# attribute on the SVG element and resolve the colors in CSS via @property.
-# That's complex.  Instead, accept that users pick dark/light at call time
-# OR we emit both and let CSS media query switch.  Too complex for now.
-#
-# Real solution we use: 5 OKLCH steps with chroma=color_chroma and the
-# caller's hue.  Lightness is chosen so steps are perceptually distinct
-# in BOTH themes by staying in the middle lightness band (35–72%).
-# The no-data cell uses var(--border) which is CSS-variable aware.
 
-# Five discrete lightness steps at fixed chroma.
-# Chroma is constant so all steps read as the same hue at different
-# intensities — the eye correctly decodes "more" vs "less" of one thing.
-# Lightness range 38–82% gives clear separation on both dark (~20% bg)
-# and light (~84% bg) surfaces.  Step 0 starts at 38% — far enough above
-# a dark surface to be clearly visible without looking washed out.
-STEPS = [38, 50, 62, 72, 82]   # lightness% only — chroma is caller-supplied
-N_STEPS = len(STEPS)
+# ── foreignObject label factory ───────────────────────────────────────────────
 
-
-def _quantize(value: float, vmax: float) -> int:
-    """Map value to a step index 0–4.
-
-    Uses a square-root scale so mid-range values spread across the middle
-    steps rather than piling up at the top.  Any positive value maps to
-    at least step 0 (never invisible).
-    """
-    if vmax <= 0 or value <= 0:
-        return -1    # sentinel: zero activity (not missing)
-    t = math.sqrt(max(0.0, min(1.0, value / vmax)))
-    return min(N_STEPS - 1, int(t * N_STEPS))
-
-
-def _step_color(step: int, hue: float, chroma: float) -> str:
-    """Return the OKLCH fill string for a given step index.
-    
-    Chroma is fixed across all steps — same hue, different brightness only.
-    """
-    return f'oklch({STEPS[step]}% {chroma:.3f} {hue})'
+def _fo_label(
+    x: float, y: float, w: float, h: float,
+    text: str,
+    *,
+    align_x: str,   # 'start' | 'center' | 'end'
+    align_y: str,   # 'start' | 'center' | 'end'
+    pad: str = '',
+) -> object:
+    style = (
+        f'--type: -2; --contrast: 0.5; '
+        f'display: flex; '
+        f'align-items: {align_y}; justify-content: {align_x}; '
+        f'height: 100%; white-space: nowrap'
+    )
+    if pad:
+        style += f'; {pad}'
+    return foreign_object(
+        x=str(x), y=str(y), width=str(w), height=str(h),
+    )(div(xmlns='http://www.w3.org/1999/xhtml', style=style)(text))
 
 
 # ── Grid geometry ─────────────────────────────────────────────────────────────
 
 def _grid_dates(weeks: int, end: date) -> tuple[date, list[date]]:
-    """Return (grid_start, all_dates) for the heatmap.
-
-    The grid always ends on the Sunday of the week containing `end`
-    so today is always visible in the rightmost columns.
-    """
     days_to_sunday = (6 - end.weekday()) % 7
     last_sunday    = end + timedelta(days=days_to_sunday)
     first_monday   = last_sunday - timedelta(days=weeks * 7 - 1)
@@ -141,7 +87,6 @@ def _grid_dates(weeks: int, end: date) -> tuple[date, list[date]]:
 
 
 def _month_label_positions(dates: list[date]) -> list[tuple[float, str]]:
-    """Return [(x, abbrev)] for month labels, spaced at least 3 weeks apart."""
     labels    = []
     last_week = -99
     for i, d in enumerate(dates):
@@ -152,51 +97,37 @@ def _month_label_positions(dates: list[date]) -> list[tuple[float, str]]:
     return labels
 
 
-# ── Legend builder ────────────────────────────────────────────────────────────
+# ── Legend ────────────────────────────────────────────────────────────────────
+# Continuous scale shown as ~5 sample stops. Not bins — just signposts
+# along the gradient so the user can read the mapping.
 
-def _legend_svg(
-    vmax:       float,
-    hue:        float,
-    chroma:     float,
-    value_fmt:  Callable[[float], str],
-    left:       float,
-    total_w:    float,
-    y:          float,
-) -> list:
-    """Build legend elements: 'Less ■■■■■ More' with value annotations."""
+def _legend_swatches(left: float, y: float) -> list:
+    """'Less ■ ■ ■ ■ ■ More' — five sample points along the 0..1 scale."""
     items = []
+    n_stops = 5
 
-    # "Less" label
-    items.append(
-        foreign_object(x=str(left), y=str(y), width='26', height=str(CELL + 2))(
-            div(xmlns='http://www.w3.org/1999/xhtml', cls='hm-legend-label')('Less')
-        )
-    )
+    items.append(_fo_label(
+        left, y, 26, CELL + 2, 'Less',
+        align_x='start', align_y='center',
+    ))
 
-    # 6 swatches: no-data + 5 steps
     swatch_x = left + 28
-    swatches = [
-        (Color.border, 'no data'),
-    ] + [
-        (_step_color(s, hue, chroma), value_fmt(vmax * (s + 1) / N_STEPS))
-        for s in range(N_STEPS)
-    ]
-
-    for s_idx, (fill, _) in enumerate(swatches):
-        sx = swatch_x + s_idx * (CELL + 3)
+    for i in range(n_stops):
+        t  = i / (n_stops - 1)          # 0, 0.25, 0.5, 0.75, 1
+        sx = swatch_x + i * (CELL + 3)
         items.append(rect(
             x=str(sx), y=str(y),
             width=str(CELL), height=str(CELL),
-            rx='2', fill=fill,
+            rx='2',
+            fill=Color.bg,
+            style=f'--color: {t:.2f}',
         ))
 
-    # "More" label
-    more_x = swatch_x + len(swatches) * (CELL + 3) + 2
-    items.append(
-        foreign_object(x=str(more_x), y=str(y), width='26', height=str(CELL + 2))(
-            div(xmlns='http://www.w3.org/1999/xhtml', cls='hm-legend-label')('More')
-        )
-    )
+    more_x = swatch_x + n_stops * (CELL + 3) + 2
+    items.append(_fo_label(
+        more_x, y, 26, CELL + 2, 'More',
+        align_x='start', align_y='center',
+    ))
 
     return items
 
@@ -207,9 +138,9 @@ def _heatmap_svg(
     data:         Dict[str, Optional[float]],
     weeks:        int,
     end:          date,
-    color_hue:    float,
-    color_chroma: float,
-    value_fmt:    Callable[[float], str],
+    color_hue:    Optional[float],
+    lo_pct:       float,
+    hi_pct:       float,
     show_dow:     bool,
     show_months:  bool,
     show_legend:  bool,
@@ -217,21 +148,39 @@ def _heatmap_svg(
 
     _, dates = _grid_dates(weeks, end)
 
-    # Scale max from the visible window only
+    # Percentile-trimmed linear mapping.
+    # A few tiny values (weekend orders of a few hundred, a dead Tuesday
+    # during a bank holiday) will otherwise drag the min down and squash
+    # every normal day into the top of the scale. A single huge day
+    # (Black Friday) does the mirror damage from the top. Trimming to
+    # a percentile band gives most cells the full 0..1 range to spread
+    # across; outliers on either end clamp.
     values = [v for v in (data.get(d.isoformat()) for d in dates)
               if v is not None and v > 0]
-    vmax   = max(values) if values else 1.0
+    if values:
+        s = sorted(values)
+        lo_idx = int(len(s) * lo_pct / 100)
+        hi_idx = min(len(s) - 1, int(len(s) * hi_pct / 100))
+        v_lo = s[lo_idx]
+        v_hi = s[hi_idx]
+        # Degenerate: if trimming collapses the range, fall back to full min/max
+        if v_hi <= v_lo:
+            v_lo, v_hi = s[0], s[-1]
+    else:
+        v_lo = v_hi = 0.0
 
-    # Dimensions
-    grid_w  = weeks * STEP - GAP
-    grid_h  = 7 * STEP - GAP
-    left    = DOW_W if show_dow     else 4
-    top     = MONTH_H if show_months else 4
+    grid_w   = weeks * STEP - GAP
+    grid_h   = 7 * STEP - GAP
+    left     = DOW_W if show_dow     else 4
+    top      = MONTH_H if show_months else 4
     legend_h = (MONTH_H + 4) if show_legend else 0
     total_w  = left + grid_w + 4
     total_h  = top  + grid_h + legend_h + 4
 
-    # ── Cells ──────────────────────────────────────────────────────────────
+    # ── Cells ────────────────────────────────────────────────────────────
+    # Two cases:
+    #   - no activity (None or <= 0)  → surface mode
+    #   - activity (val > 0)          → linear map val → [v_lo, v_hi] → [0, 1]
     cells = []
     for i, d in enumerate(dates):
         week_idx = i // 7
@@ -240,133 +189,119 @@ def _heatmap_svg(
         cy       = top  + dow      * STEP
         val      = data.get(d.isoformat())
 
-        if val is None:
-            fill = Color.border        # no data — CSS surface border token
+        if val is None or val <= 0:
+            cells.append(rect(
+                x=str(cx), y=str(cy),
+                width=str(CELL), height=str(CELL),
+                rx='2', fill=Color.bg,
+            ))
         else:
-            step = _quantize(val, vmax)
-            if step < 0:
-                # Zero activity: use step 0 at reduced chroma so it reads
-                # as "empty but tracked" — same hue family, clearly dim
-                fill = f'oklch({STEPS[0]}% {color_chroma * 0.35:.3f} {color_hue})'
+            if v_hi == v_lo:
+                t = 0.5
             else:
-                fill = _step_color(step, color_hue, color_chroma)
+                t = max(0.0, min(1.0, (val - v_lo) / (v_hi - v_lo)))
+            cells.append(rect(
+                x=str(cx), y=str(cy),
+                width=str(CELL), height=str(CELL),
+                rx='2',
+                fill=Color.bg,
+                style=f'--color: {t:.3f}',
+            ))
 
-        cells.append(rect(
-            x=str(cx), y=str(cy),
-            width=str(CELL), height=str(CELL),
-            rx='2', fill=fill,
-        ))
-
-    # ── Day-of-week labels — HTML via foreignObject ───────────────────────
-    # foreignObject places an HTML span at SVG coordinates.
-    # The span inherits font-family, color, and font-size from the CSS
-    # cascade — no hardcoded font attributes needed.
+    # ── Day-of-week labels ───────────────────────────────────────────────
     dow_labels = []
     if show_dow:
-        fo_w = left - 2     # width of the foreignObject box
-        fo_h = CELL + 2     # height matches cell height
+        fo_w = left - 2
+        fo_h = CELL + 2
         for dow_idx, name in [(0, 'Mon'), (2, 'Wed'), (4, 'Fri')]:
             fy = top + dow_idx * STEP
-            dow_labels.append(
-                foreign_object(
-                    x='0', y=f'{fy:.1f}',
-                    width=str(fo_w), height=str(fo_h),
-                )(
-                    div(
-                        xmlns='http://www.w3.org/1999/xhtml',
-                        cls='hm-dow-label',
-                    )(name)
-                )
-            )
+            dow_labels.append(_fo_label(
+                0, fy, fo_w, fo_h, name,
+                align_x='end', align_y='center',
+                pad='padding-right: 3px',
+            ))
 
-    # ── Month labels — HTML via foreignObject ─────────────────────────────
+    # ── Month labels ─────────────────────────────────────────────────────
     month_labels = []
     if show_months:
-        fo_h = MONTH_H
         for x, name in _month_label_positions(dates):
-            month_labels.append(
-                foreign_object(
-                    x=str(x), y='0',
-                    width=str(STEP * 3), height=str(fo_h),
-                )(
-                    div(
-                        xmlns='http://www.w3.org/1999/xhtml',
-                        cls='hm-month-label',
-                    )(name)
-                )
-            )
+            month_labels.append(_fo_label(
+                x, 0, STEP * 3, MONTH_H, name,
+                align_x='start', align_y='end',
+                pad='padding-bottom: 2px',
+            ))
 
-    # ── Legend ─────────────────────────────────────────────────────────────
+    # ── Legend ───────────────────────────────────────────────────────────
     legend_els = []
     if show_legend:
         legend_y = top + grid_h + 8
-        legend_els = _legend_svg(vmax, color_hue, color_chroma,
-                                  value_fmt, left, total_w, legend_y)
+        legend_els = _legend_swatches(left, legend_y)
+
+    # ── Assembly ─────────────────────────────────────────────────────────
+    root_style = f'--hue: {color_hue}' if color_hue is not None else None
 
     return svg(
-        cls='activity-heatmap',
         viewBox=f'0 0 {total_w} {total_h}',
         width=str(total_w),
         height=str(total_h),
+        style=root_style,
         **{'aria-label': 'activity heatmap'},
     )(
-        g(cls='hm-months')(*month_labels),
-        g(cls='hm-dow')(*dow_labels),
-        g(cls='hm-cells')(*cells),
-        g(cls='hm-legend')(*legend_els),
+        g()(*month_labels),
+        g()(*dow_labels),
+        g()(*cells),
+        g()(*legend_els),
     )
 
 
 # ── Public component ──────────────────────────────────────────────────────────
 
 def activity_heatmap(
-    data:          Dict[str, Optional[float]],
+    data:                Dict[str, Optional[float]],
     *,
-    label:         str = '',
-    weeks:         int = 52,
-    end:           Optional[date] = None,
-    color_hue:     float = 142,
-    color_chroma:  float = 0.18,
-    value_fmt:     Callable[[float], str] = lambda v: fmt_value(v),
-    show_dow:      bool = True,
-    show_months:   bool = True,
-    show_legend:   bool = True,
-    cls:           str = '',
-    id:            Optional[str] = None,
+    label:               str = '',
+    weeks:               int = 52,
+    end:                 Optional[date] = None,
+    color_hue:           Optional[float] = 142,
+    outlier_percentiles: tuple[float, float] = (5, 95),
+    show_dow:            bool = True,
+    show_months:         bool = True,
+    show_legend:         bool = True,
+    cls:                 str = '',
+    id:                  Optional[str] = None,
 ) -> object:
     """GitHub-style 52-week activity heatmap.
 
-    Parameters
-    ----------
-    data          : {ISO-date-string: value | None} — missing key = no data
-    label         : optional caption below the heatmap
-    weeks         : columns of weeks to show (default 52)
-    end           : rightmost date (default today)
-    color_hue     : OKLCH hue  142=green  220=blue  25=orange  280=purple
-    color_chroma  : OKLCH chroma — saturation of the color ramp
-    value_fmt     : formats a value for the legend scale
-    show_dow      : Mon / Wed / Fri labels on the left
-    show_months   : month abbreviations above the grid
-    show_legend   : Less ■■■■■ More scale below the grid
-    cls, id       : HTML attributes on the wrapper div
+    color_hue
+        Numeric — pin the hue at the SVG root.
+        None    — inherit hue from surrounding context (.suc/.inf/.wrn/.dgr
+                  or any ancestor setting --hue / --hue-shift).
+
+    outlier_percentiles
+        (lo, hi) percentile band used for the color scale endpoints.
+        Default (5, 95): values at/below the 5th percentile clamp to
+        --color: 0; values at/above the 95th clamp to --color: 1; the
+        middle 90% get the full range to spread across. Use (0, 100)
+        for pure min/max linear with no trimming.
+
+    Wrap the result in layout.card() for a surface/border/padding wrapper.
     """
     end = end or date.today()
+    lo_pct, hi_pct = outlier_percentiles
 
     hmap_svg = _heatmap_svg(
         data=data, weeks=weeks, end=end,
-        color_hue=color_hue, color_chroma=color_chroma,
-        value_fmt=value_fmt,
+        color_hue=color_hue,
+        lo_pct=lo_pct, hi_pct=hi_pct,
         show_dow=show_dow, show_months=show_months, show_legend=show_legend,
     )
 
-    # activity_heatmap returns bare content — no surface wrapper.
-    # Wrap in card() from md_web.ui.layout for surface/border/padding.
-    extra_cls = f' {cls}' if cls else ''
-    attrs     = {'cls': f'activity-heatmap-wrap{" " + extra_cls if extra_cls else ""}'}
+    wrapper_cls = f'stack{" " + cls if cls else ""}'
+    attrs = {'cls': wrapper_cls}
     if id:
         attrs['id'] = id
 
     return div(**attrs)(
         hmap_svg,
-        small(cls='heatmap-label')(label) if label else None,
+        small()(label) if label else None,
     )

@@ -34,7 +34,7 @@ from md_web import (
     Safe, html_doc, mk_tag,
     Datastar, Favicon,
     patch_elements,
-    create_app, serve,
+    create_app, serve, static
 )
 from md_web.db import create_db, create_db_relay, migrate, query, write
 
@@ -50,6 +50,7 @@ from md_web.ui.layout      import card, grid, section
 head   = mk_tag('head')
 body   = mk_tag('body')
 meta   = mk_tag('meta')
+link   = mk_tag('link')
 title_ = mk_tag('title')
 style  = mk_tag('style')
 div    = mk_tag('div')
@@ -96,7 +97,7 @@ CREATE TABLE IF NOT EXISTS cat_history (
 HISTORY_LEN = 24
 CAT_HISTORY_LEN = 20  # ticks of category history for line chart
 
-# ── Data definitions ──────────────────────────────────────────────────────────
+#d ── Data definitions ──────────────────────────────────────────────────────────
 
 # KPI metrics: (slug, label, start, volatility, fmt)
 METRIC_DEFS = [
@@ -441,8 +442,13 @@ def render_app(conn):
                 data      = daily_data,
                 weeks     = 52,
                 color_hue = 142,
-                value_fmt = lambda v: f'${v:,.0f}',
                 show_legend = True,
+            ),
+            activity_heatmap(
+                data = daily_data,
+                weeks = 52,
+                color_hue = 142,
+                outlier_percentiles = (15, 99),   # try this first
             )
         )
     )
@@ -561,6 +567,7 @@ def landing(conn):
     h = head(
         meta(charset='utf-8'),
         meta(name='viewport', content='width=device-width, initial-scale=1'),
+        link(rel='stylesheet', href='static/style.css'),
         title_('md-web.ui — Dashboard Demo'),
         Favicon('📈'),
         style(Safe(css)),
@@ -614,6 +621,7 @@ def startup(loop):
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = create_app(on_init=startup)
+static(app, "/static", "static/")
 
 @app.get('/')
 async def index(req):
