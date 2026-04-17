@@ -24,6 +24,7 @@ Run
 """
 
 import asyncio
+import time
 import json
 import math
 import random
@@ -105,6 +106,7 @@ METRIC_DEFS = [
     ('conversion', 'Conversion Rate',  3.42,      0.012, lambda v: f'{v:.2f}%'),
     ('ecomm_share','E-Comm Share',     18.4,      0.008, lambda v: f'{v:.1f}%'),
     ('margin',     'Gross Margin',     34.2,      0.006, lambda v: f'{v:.1f}%'),
+    ('fps',        'Actual FPS',       60.0,      0.0,   lambda v: f'{v:.1f}'),
 ]
 
 # Retail categories for bar charts: (slug, label, base_value_billions)
@@ -126,6 +128,7 @@ C_ID, C_SLUG, C_LABEL, C_VALUE, C_PREV = 0,1,2,3,4
 # ── Seed ─────────────────────────────────────────────────────────────────────
 
 def seed(conn):
+
     # Metrics
     if conn.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 0:
         for slug, label, start, vol, _ in METRIC_DEFS:
@@ -184,6 +187,21 @@ def seed(conn):
 def _tick(conn):
     """Advance all metrics and category values one random-walk step."""
     defs = {d[0]: d for d in METRIC_DEFS}
+
+    # Track actual frame time for FPS
+
+    now = time.time()
+    if not hasattr(_tick, '_last_time'):
+        _tick._last_time = now
+    actual_fps = 1.0 / (now - _tick._last_time) if (now - _tick._last_time) > 0 else 60
+    _tick._last_time = now
+
+    # Update FPS metric
+    conn.execute(
+        "UPDATE metrics SET value=?, history=? WHERE slug='fps'",
+        (actual_fps, json.dumps([actual_fps] * HISTORY_LEN)),
+    )
+
 
     # Metrics
     for row in conn.execute("SELECT * FROM metrics").fetchall():
@@ -562,11 +580,13 @@ def landing(conn):
 
 # ── Tick loop ─────────────────────────────────────────────────────────────────
 
+
+
 async def tick_loop():
     await _ready.wait()
     while True:
-        await asyncio.sleep(0.002)
-        write(db, _tick)
+        await asyncio.sleep(0.0167)  # 16.7ms = 60 FPS target
+        write(db, _tick)  # _tick handles everything including FPS
 
 # ── Module state ──────────────────────────────────────────────────────────────
 
