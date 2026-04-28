@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Michael Deufel">
+<meta name="description" content="Resume of Michael Deufel — engineer focused on technical problem-solving with customers. Full-stack product work, operations research, and utility infrastructure.">
+<meta name="theme-color" content="#f0f0f0">
+<title>Michael Deufel — Resume</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' ry='6' fill='white'/%3E%3Ctext x='16' y='24' text-anchor='middle' font-family='Times New Roman, serif' font-weight='700' font-size='28' fill='black'%3EM%3C/text%3E%3C/svg%3E">
+<style>
+/* Document baseline. The viewport is the stage; the paper is the actor. */
+html, body {
+    margin: 0;
+    padding: 0;
+    block-size: 100dvh;
+    inline-size: 100dvw;
+    background: #f0f0f0;
+    overflow: hidden;
+}
+body {
+    font-family: "Times New Roman", Times, serif;
+    color: black;
+    display: grid;
+    place-items: center;
+}
+
+/* Paper — US Letter portrait, sized to fit the viewport.
+   We pick the largest 8.5:11 rectangle that fits inside the screen.
+
+   IMPORTANT: a CSS container cannot size itself with its own cqi
+   units (that's a dependency cycle — the browser drops the rule).
+   So .paper owns the dimensions and is the container, and .sheet
+   inside it owns the padding and the content. .sheet reads cqi
+   from .paper without creating a cycle. */
+.paper {
+    inline-size: min(100dvw, 100dvh * 8.5 / 11);
+    aspect-ratio: 8.5 / 11;
+    background: white;
+    /* Shadow uses viewport math directly — same reason as --u below.
+       Can't use cqi here: a container can't query its own dimensions. */
+    box-shadow:
+        0
+        calc(min(100dvw, 100dvh * 8.5 / 11) * 0.0025)
+        calc(min(100dvw, 100dvh * 8.5 / 11) * 0.01)
+        rgba(0,0,0,0.15);
+    box-sizing: border-box;
+
+    /* Force browsers to honor background/border styling when printing.
+       Without this, some browsers strip backgrounds and dim borders
+       to save ink — which would mean missing chip pills and a missing
+       header underline on the printed page. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+
+    /* Paper is the container. Kept so role articles can still nest
+       their own inline-size containers for the chip-rail layout. */
+    container-type: size;
+    container-name: paper;
+
+    /* Hard clip — content past the bottom edge is hidden, not scrolled. */
+    overflow: hidden;
+}
+
+/* The sheet is where content actually lives. Padding here, not on
+   .paper, because .paper cannot reference its own cqi. The sheet
+   fills the paper exactly, with its 0.5in equivalent of inset. */
+.sheet {
+    box-sizing: border-box;
+    inline-size: 100%;
+    block-size: 100%;
+
+    /* The base unit. 1% of paper width.
+
+       CRITICAL: we cannot use `1cqi` here. cqi (and all container
+       query units) are resolved at USE time against the nearest
+       matching container, not at the property's definition site.
+       Inside <main>, each role <article> declares its own
+       inline-size container (so its <ul> can do `inline-size: 75cqi`
+       for the chip rail). That nested container hijacks any cqi
+       reference downstream — `var(--u)` resolves as 1% of article
+       width, not 1% of paper width, shrinking everything by ~25%.
+
+       Solution: anchor --u to the viewport math directly. The paper's
+       width is min(100dvw, 100dvh * 8.5/11), so 1% of paper width is
+       that same expression / 100. Viewport units always resolve
+       against the viewport, never against an intermediate container,
+       so --u stays paper-relative no matter how many nested
+       containers it travels through. */
+    --u: calc(min(100dvw, 100dvh * 8.5 / 11) / 100);
+
+    padding: calc(var(--u) * 5.882);
+
+    /* Body text: 10pt = 13.33px on an 816px-wide letter page = ~1.633% of width.
+       This is the traditional academic CV / journal body size. */
+    font-size: calc(var(--u) * 1.633);
+    line-height: 1.4;
+}
+
+@media print {
+    html, body { background: white; overflow: visible; block-size: auto; inline-size: auto; }
+    body { display: block; }
+    .paper {
+        /* In print, fill the page exactly. */
+        inline-size: 8.5in;
+        block-size: 11in;
+        aspect-ratio: auto;
+        box-shadow: none;
+        margin: 0;
+    }
+    .sheet {
+        /* In print, --u is 1% of 8.5in. */
+        --u: 0.085in;
+    }
+    @page { margin: 0; size: letter; }
+}
+</style>
+</head>
+
+<body>
+
+<article class="paper">
+<div class="sheet">
+    <style>
+    /* Sheet-level layout: header up top, main + aside below.
+       All spacing in --u so it scales with the paper.
+       :scope here = .sheet (the parent of this <style>). */
+    @scope {
+        :scope {
+            display: grid;
+            grid-template:
+                "header header" auto
+                "main   aside"  1fr
+                / 3fr   1fr;
+            column-gap: calc(var(--u) * 2.2);
+            row-gap: calc(var(--u) * 1.5);
+            block-size: 100%;
+        }
+        > header {
+            grid-area: header;
+            padding-block-end: calc(var(--u) * 1);
+            border-block-end: 1px solid black;
+            display: grid;
+            grid-template-columns: 1fr auto;
+            column-gap: calc(var(--u) * 2);
+            align-items: end;
+        }
+        > main   { grid-area: main; min-block-size: 0; }
+        > aside  {
+            grid-area: aside;
+            padding-inline-start: calc(var(--u) * 1.5);
+            border-inline-start: 1px solid black;
+            min-block-size: 0;
+        }
+
+        > header h1 { margin: 0 0 calc(var(--u) * 0.4); font-size: calc(var(--u) * 2.941); }
+        > header p  { margin: 0; font-size: calc(var(--u) * 1.797); opacity: 0.8; }
+        > header address {
+            font-style: normal;
+            text-align: end;
+            font-size: calc(var(--u) * 1.470);
+            line-height: 1.35;
+            display: flex;
+            flex-direction: column;
+        }
+        > header address a { color: inherit; text-decoration: none; }
+    }
+    </style>
+
+    <header>
+        <div>
+            <h1>Michael Deufel</h1>
+            <p>Engineer focused on technical problem-solving with customers. Background in full-stack product work, operations research, and utility infrastructure.</p>
+        </div>
+        <address>
+            <a href="mailto:MDeufel13@gmail.com">MDeufel13@gmail.com</a>
+            <a href="https://github.com/Deufel">github.com/Deufel</a>
+            <a href="https://www.linkedin.com/in/mdeufel/">linkedin.com/in/mdeufel</a>
+            <a href="tel:+13312204995">+1 (331) 220-4995</a>
+        </address>
+    </header>
+
+    <main>
+        <style>
+        /* Roles stack vertically inside main. Each article still gets its
+           own inline-size container for the `inline-size: 75cqi` work-list
+           rule — but that 75cqi resolves against the article, while spacing
+           tokens use --u which was pinned at the paper level and inherited
+           through unchanged. */
+        @scope {
+            :scope {
+                display: flex;
+                flex-direction: column;
+                gap: calc(var(--u) * 1.6);
+            }
+            article {
+                container-type: inline-size;
+                display: grid;
+                grid-template:
+                    "title    meta"    auto
+                    "org      loc"     auto
+                    "summary  summary" auto
+                    "work     tags"    auto
+                    / 1fr     auto;
+                column-gap: calc(var(--u) * 1.5);
+                row-gap: 0;
+            }
+            article h3      { grid-area: title; margin: 0; font-size: calc(var(--u) * 1.797); font-weight: 700; line-height: 1; }
+            article time    { grid-area: meta;  font-size: calc(var(--u) * 1.470); opacity: 0.7; text-align: end; align-self: baseline; line-height: 1; }
+            article h4      { grid-area: org;   margin: 0; font-size: calc(var(--u) * 1.633); font-weight: 400; opacity: 0.85; line-height: 1; }
+            article address { grid-area: loc;   font-size: calc(var(--u) * 1.470); opacity: 0.7; text-align: end; align-self: baseline; font-style: normal; line-height: 1; }
+            article p       { grid-area: summary; margin: calc(var(--u) * 0.35) 0 calc(var(--u) * 0.25); font-size: calc(var(--u) * 1.633); line-height: 1.1; }
+            article ul {
+                grid-area: work;
+                margin: 0;
+                padding-inline-start: 1.25em;
+                line-height: 1;
+                list-style-type: square;
+                /* 75% of the role article's width — chips
+                   get the remaining ~25% on the right. */
+                inline-size: 75cqi;
+            }
+            article li {
+                font-size: calc(var(--u) * 1.633);
+                line-height: 1;
+                margin-block-end: calc(var(--u) * 0.6);
+                text-align: justify;
+                hyphens: auto;
+                hyphenate-limit-chars: 6 3 3;
+            }
+            article > div {
+                grid-area: tags;
+                display: flex;
+                flex-wrap: wrap;
+                gap: calc(var(--u) * 0.35);
+                align-content: flex-start;
+            }
+            article > div span {
+                font-size: calc(var(--u) * 1.307);
+                padding: 0.1em 0.5em;
+                border: 1px solid rgba(0, 0, 0, 0.4);
+                border-radius: 999px;
+                white-space: nowrap;
+            }
+        }
+        </style>
+
+        <article>
+            <h3>Full Stack Developer</h3>
+            <time>2024 — 2026</time>
+            <h4>Event OS LLC</h4>
+            <address>Chicago, IL</address>
+            <p>Co-founded a startup building software for coordinating in-person beverage marketing across suppliers, distributors, retailers, and regulators.</p>
+            <ul>
+                <li>Shipped OAuth, user signup, server-side state management, and event-import pipelines.</li>
+                <li>Selected an application stack of Granian, Datastar, SQLite, and Litestream to minimize API churn and operational overhead.</li>
+                <li>Self-hosted production: Linux with Docker, Coolify, reverse proxy with TLS, and security hardening.</li>
+                <li>Began migration to CQRS with event sourcing on SQLite, with WAL replication to S3 via Litestream for audit and disaster recovery.</li>
+                <li>Designed the data model around regulatory variation in event permitting across jurisdictions.</li>
+            </ul>
+            <div>
+                <span>CQRS</span>
+                <span>Event sourcing</span>
+                <span>SQLite</span>
+                <span>APSW</span>
+                <span>Litestream</span>
+                <span>Granian</span>
+                <span>Datastar</span>
+                <span>Docker</span>
+                <span>Coolify</span>
+                <span>OAuth</span>
+            </div>
+        </article>
+
+        <article>
+            <h3>Data Scientist</h3>
+            <time>2022 — 2024</time>
+            <h4>Superior Beverage Co. Inc.</h4>
+            <address>Montgomery, IL</address>
+            <p>Embedded data scientist at a regional beverage distributor; operations research, decision-support systems, and KPI infrastructure.</p>
+            <ul>
+                <li>Cleaned and normalized legacy ERP data covering package weights, vehicle constraints, and delivery records.</li>
+                <li>Built time-distance matrices via the Google Maps API and ran routing scenarios in OR-Tools and Timefold; time-on-route generalized better than mileage as a cost function.</li>
+                <li>Modeled customer lifetime value across service levels, route economics, and account-level revenue patterns; identified which contractual and operational levers actually moved CLV.</li>
+                <li>Estimated ~25% available time savings on routes at constant delivery frequency, validated in OR-Tools and Timefold; recommended GPS tracking adoption to close the data gap blocking implementation.</li>
+                <li>Built four role-gated KPI dashboards over live ERP data, covering operations, sales team, sales analytics, and company-wide views, with user-driven grouping and aggregation.</li>
+            </ul>
+            <div>
+                <span>Operations Research</span>
+                <span>CLV modeling</span>
+                <span>Routing optimization</span>
+                <span>OR-Tools</span>
+                <span>Timefold</span>
+                <span>Snowflake</span>
+                <span>Power BI</span>
+                <span>ETL</span>
+                <span>ERP</span>
+            </div>
+        </article>
+
+        <article>
+            <h3>Business &amp; Data Consultant</h3>
+            <time>2021 — 2022</time>
+            <h4>Primera Engineers — Consulting Division</h4>
+            <address>Chicago, IL</address>
+            <p>Supported a multi-year utility acquisition change-management program, aligning operational procedures across multiple states.</p>
+            <ul>
+                <li>Built Power BI dashboards automating milestone reporting and Gantt-chart updates for executive stakeholders.</li>
+                <li>Translated procedural differences between acquired and acquiring utilities into a single set of working standards adopted across regions.</li>
+            </ul>
+            <div>
+                <span>Change management</span>
+                <span>Process standardization</span>
+                <span>Power BI</span>
+                <span>Utilities</span>
+                <span>Stakeholder reporting</span>
+            </div>
+        </article>
+
+        <article>
+            <h3>Electrical Engineer (Levels 1–3)</h3>
+            <time>2015 — 2020</time>
+            <h4>Primera Engineers — Utilities Division</h4>
+            <address>Chicago, IL</address>
+            <p>Engineering ownership across utility distribution projects; advanced from individual contributor to team lead managing 8–10 engineers.</p>
+            <ul>
+                <li>Led a team of 8–10 engineers; owned hiring, performance reviews, and project delivery.</li>
+                <li>Reviewed project performance weekly with stakeholders against scope, schedule, and budget; identified variances and corrective actions.</li>
+                <li>Project portfolio spanned distribution feeder studies in CYME, new line construction, distribution automation, and high-rise electrical vault design.</li>
+            </ul>
+            <div>
+                <span>Team lead</span>
+                <span>Distribution automation</span>
+                <span>CYME</span>
+                <span>High-rise electrical</span>
+                <span>P&amp;L ownership</span>
+            </div>
+        </article>
+    </main>
+
+    <aside>
+        <style>
+        /* Aside-level: sections stack vertically. Each section has its
+           own internal layout via its own @scope block below. */
+        @scope {
+            :scope {
+                display: flex;
+                flex-direction: column;
+                gap: calc(var(--u) * 1.5);
+            }
+            section { display: flex; flex-direction: column; gap: calc(var(--u) * 0.3); }
+            section > h2 {
+                margin: 0;
+                font-size: calc(var(--u) * 1.470);
+                opacity: 0.6;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+            }
+            /* Extra breathing room above each section heading after the
+               first, so section breaks read as breaks. Sits on top of
+               the parent's gap, giving total separation = gap + margin. */
+            section + section > h2 { margin-block-start: calc(var(--u) * 1.6); }
+        }
+        </style>
+
+        <section class="education">
+            <style>
+            @scope {
+                article {
+                    display: grid;
+                    grid-template:
+                        "degree   year"
+                        "school   school"
+                        / 1fr     auto;
+                    column-gap: calc(var(--u) * 0.7);
+                    row-gap: calc(var(--u) * 0.05);
+                    margin-block-end: calc(var(--u) * 0.7);
+                }
+                article .degree { grid-area: degree; font-size: calc(var(--u) * 1.633); font-weight: 700; }
+                article time    { grid-area: year;   font-size: calc(var(--u) * 1.470); opacity: 0.7; align-self: baseline; }
+                article .school { grid-area: school; font-size: calc(var(--u) * 1.470); opacity: 0.75; }
+            }
+            </style>
+            <h2>Education</h2>
+            <article>
+                <span class="degree">M.S. Data Science - AI Specialization</span>
+                <time>2023</time>
+                <span class="school">Northwestern University</span>
+            </article>
+            <article>
+                <span class="degree">B.S. Elec. Eng.</span>
+                <time>2015</time>
+                <span class="school">Purdue University</span>
+            </article>
+        </section>
+
+        <section class="coding">
+            <style>
+            @scope {
+                ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: calc(var(--u) * 0.35); }
+                li {
+                    display: grid;
+                    grid-template-columns: 1fr auto;
+                    align-items: center;
+                    gap: calc(var(--u) * 0.7);
+                    font-size: calc(var(--u) * 1.633);
+                }
+                svg { inline-size: 4em; block-size: 0.65em; }
+                svg rect[fill="currentColor"]   { fill: black }
+                svg rect[stroke="currentColor"] { fill: none; stroke: black }
+            }
+            </style>
+            <h2>Coding exp</h2>
+            <ul>
+                <li>
+                    <span>Python</span>
+                    <svg viewBox="0 0 50 8" aria-label="4 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>SQL</span>
+                    <svg viewBox="0 0 50 8" aria-label="3 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>HTML/CSS</span>
+                    <svg viewBox="0 0 50 8" aria-label="5 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>JavaScript</span>
+                    <svg viewBox="0 0 50 8" aria-label="3 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>R</span>
+                    <svg viewBox="0 0 50 8" aria-label="2 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>Bash</span>
+                    <svg viewBox="0 0 50 8" aria-label="2 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+                <li>
+                    <span>Mojo</span>
+                    <svg viewBox="0 0 50 8" aria-label="1 of 5">
+                        <rect x="0"  y="0" width="8" height="8" fill="currentColor"/>
+                        <rect x="10" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="20" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="30" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                        <rect x="40" y="0" width="8" height="8" fill="none" stroke="currentColor"/>
+                    </svg>
+                </li>
+            </ul>
+        </section>
+
+        <section class="oss">
+            <style>
+            @scope {
+                article { display: flex; flex-direction: column; gap: calc(var(--u) * 0.15); }
+                article .heading {
+                    display: flex;
+                    align-items: baseline;
+                    gap: calc(var(--u) * 0.6);
+                }
+                article .project { font-size: calc(var(--u) * 1.633); font-weight: 700; }
+                article .meta {
+                    font-size: calc(var(--u) * 1.307);
+                    opacity: 0.65;
+                    white-space: nowrap;
+                }
+                article p { margin: 0; font-size: calc(var(--u) * 1.470); opacity: 0.85; }
+                code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+            }
+            </style>
+            <h2>Open source contribution</h2>
+            <article>
+                <div class="heading">
+                    <span class="project">marimo</span>
+                    <span class="meta">20k+★</span>
+                </div>
+                <p>Generalized the public API for <code>uv</code> package management.</p>
+            </article>
+        </section>
+
+        <section class="demos">
+            <style>
+            @scope {
+                :scope { gap: calc(var(--u) * 0.5); }
+                article { display: flex; flex-direction: column; gap: calc(var(--u) * 0.1); }
+                article .heading {
+                    display: flex;
+                    align-items: baseline;
+                    gap: calc(var(--u) * 0.6);
+                }
+                article .project { font-size: calc(var(--u) * 1.633); font-weight: 700; }
+                article p { margin: 0; font-size: calc(var(--u) * 1.470); opacity: 0.85; line-height: 1.25; }
+                article a { color: inherit; }
+            }
+            </style>
+            <h2>Live demos</h2>
+            <article>
+                <div class="heading">
+                    <span class="project">clock</span>
+                </div>
+                <p>Task tracker. <a href="http://clock.event-os.com">clock.event-os.com</a></p>
+            </article>
+            <article>
+                <div class="heading">
+                    <span class="project">wave</span>
+                </div>
+                <p>Real-time chat. <a href="http://wave.event-os.com">wave.event-os.com</a></p>
+            </article>
+        </section>
+
+        <section class="projects">
+            <style>
+            @scope {
+                :scope { gap: calc(var(--u) * 0.5); }
+                article { display: flex; flex-direction: column; gap: calc(var(--u) * 0.1); }
+                article .heading {
+                    display: flex;
+                    align-items: baseline;
+                    gap: calc(var(--u) * 0.6);
+                }
+                article .project { font-size: calc(var(--u) * 1.633); font-weight: 700; }
+                article .meta {
+                    font-size: calc(var(--u) * 1.307);
+                    opacity: 0.65;
+                    white-space: nowrap;
+                }
+                article p { margin: 0; font-size: calc(var(--u) * 1.470); opacity: 0.85; line-height: 1.25; }
+                code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; }
+            }
+            </style>
+            <h2>Libraries</h2>
+            <article>
+                <div class="heading">
+                    <span class="project">py_sse</span>
+                    <span class="meta">PyPI · 0.x</span>
+                </div>
+                <p>Granian/RSGI server for SSE and CQRS.</p>
+            </article>
+            <article>
+                <div class="heading">
+                    <span class="project">html_tags</span>
+                    <span class="meta">PyPI · 0.x</span>
+                </div>
+                <p>Namespace-aware HTML/SVG/MathML DSL.</p>
+            </article>
+            <article>
+                <div class="heading">
+                    <span class="project">marimo-dev</span>
+                    <span class="meta">PyPI · 0.x</span>
+                </div>
+                <p>Marimo notebooks to PyPI packages.</p>
+            </article>
+        </section>
+    </aside>
+</div>
+</article>
+
+</body>
+</html>
